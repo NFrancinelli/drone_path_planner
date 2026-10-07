@@ -1,0 +1,105 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 30
+      Color: 160; 160; 164
+      Alpha: 0.5
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Name: World axes
+      Enabled: true
+      Reference Frame: odom
+      Length: 1
+      Radius: 0.03
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Drone
+      Enabled: true
+      Namespaces:
+        drone: true
+      Topic:
+        Value: /drone_model
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: Planned trajectory
+      Enabled: true
+      Color: 255; 140; 0
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.04
+      Buffer Length: 1
+      Pose Style: None
+      Topic:
+        Value: /planned_trajectory
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: Flown trail
+      Enabled: true
+      Color: 0; 200; 120
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.03
+      Buffer Length: 1
+      Pose Style: None
+      Topic:
+        Value: /trail
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 38; 41; 48
+    Fixed Frame: odom
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Target Frame: odom
+      Distance: 11
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 1.5
+      Pitch: 0.55
+      Yaw: 3.9
+      Near Clip Distance: 0.01
+      Value: Orbit (rviz)
+    Saved: ~
+Window Geometry:
+  Width: 1280
+  Height: 800
+  Hide Left Dock: false
+  Displays:
+    collapsed: false
