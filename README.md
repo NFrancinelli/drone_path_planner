@@ -56,6 +56,7 @@ ground truth during the figure-eight, its heading error grows with turn rate (p9
 |---|---|
 | `docker/` | Ubuntu 24.04 + ROS 2 Jazzy + Gazebo Harmonic + PX4 v1.17.0 + XRCE-DDS agent |
 | `ros2_ws/src/trajectory_server` | Streams setpoints to PX4 in offboard mode; ROS-free trajectory core with unit tests |
+| `ros2_ws/src/path_planner` | A* on a voxel map with obstacle inflation and a cost for unknown space; ROS-free core with unit tests |
 | `ros2_ws/src/px4_state_bridge` | PX4 odometry → `/odom`, TF, flown trail, drone model for RViz; `mocap_bridge` feeds ground truth to PX4 as external vision |
 | `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world |
 | `ros2_ws/src/drone_bringup` | Launch files, RViz config |

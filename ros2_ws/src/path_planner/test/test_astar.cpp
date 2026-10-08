@@ -1,0 +1,213 @@
+#include <cmath>
+#include <limits>
+#include <unordered_map>
+
+#include <gtest/gtest.h>
+
+#include "path_planner/astar.hpp"
+
+using path_planner::AStarPlanner;
+using path_planner::Key;
+using path_planner::KeyHash;
+using path_planner::Occupancy;
+using path_planner::OccupancyMap;
+using Status = AStarPlanner::Status;
+
+namespace
+{
+
+// 0.25 is exact in binary, avoids floor() rounding issues on box edges.
+constexpr double kRes = 0.25;
+constexpr double kLayerZ = 1.125;  // center of the single z layer most tests plan in
+
+// Sparse map: every voxel is `fill` unless set otherwise.
+class TestMap : public OccupancyMap
+{
+public:
+  explicit TestMap(Occupancy fill)
+  : fill_(fill) {}
+
+  double resolution() const override {return kRes;}
+
+  Occupancy at(const Key & k) const override
+  {
+    const auto it = cells_.find(k);
+    return it == cells_.end() ? fill_ : it->second;
+  }
+
+  // Sets every voxel from the one containing `lo` to the one containing `hi`.
+  void set_box(const Eigen::Vector3d & lo, const Eigen::Vector3d & hi, Occupancy occ)
+  {
+    const Key a = key(lo), b = key(hi);
+    for (int x = a.x(); x <= b.x(); ++x) {
+      for (int y = a.y(); y <= b.y(); ++y) {
+        for (int z = a.z(); z <= b.z(); ++z) {
+          cells_[Key(x, y, z)] = occ;
+        }
+      }
+    }
+  }
+
+private:
+  Occupancy fill_;
+  std::unordered_map<Key, Occupancy, KeyHash> cells_;
+};
+
+// Bounds with a single voxel layer at kLayerZ (2D tests).
+Eigen::AlignedBox3d flat_bounds(double x0, double y0, double x1, double y1)
+{
+  return Eigen::AlignedBox3d(Eigen::Vector3d(x0, y0, 1.0), Eigen::Vector3d(x1, y1, 1.25));
+}
+
+// Min distance from path voxel centers (start excluded) to an occupied voxel center.
+double min_clearance(const TestMap & map, const std::vector<Eigen::Vector3d> & path)
+{
+  double clearance = std::numeric_limits<double>::infinity();
+  for (size_t i = 1; i < path.size(); ++i) {
+    const Key k = map.key(path[i]);
+    for (int dx = -4; dx <= 4; ++dx) {
+      for (int dy = -4; dy <= 4; ++dy) {
+        for (int dz = -4; dz <= 4; ++dz) {
+          const Key n = k + Key(dx, dy, dz);
+          if (map.at(n) == Occupancy::Occupied) {
+            clearance = std::min(clearance, (map.center(n) - map.center(k)).norm());
+          }
+        }
+      }
+    }
+  }
+  return clearance;
+}
+
+// Wall at x = 2.5..2.75 m spanning the whole test area, with a gap at y = 0.75 m and up.
+TestMap wall_with_gap(int gap_voxels)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({2.6, -10.0, 0.0}, {2.6, 10.0, 3.0}, Occupancy::Occupied);
+  map.set_box({2.6, 0.8, 0.0}, {2.6, 0.8 + (gap_voxels - 1) * kRes, 3.0}, Occupancy::Free);
+  return map;
+}
+
+AStarPlanner::Params wall_params()
+{
+  AStarPlanner::Params params;
+  params.inflation_radius = 0.3;
+  params.bounds = flat_bounds(-1.0, -2.0, 6.0, 3.0);
+  return params;
+}
+
+const Eigen::Vector3d kWallStart(0.125, 0.125, kLayerZ);
+const Eigen::Vector3d kWallGoal(5.125, 0.125, kLayerZ);
+
+}  // namespace
+
+TEST(AStar, StraightLineInFreeSpace)
+{
+  const TestMap map(Occupancy::Free);
+  AStarPlanner::Params params;
+  const Eigen::Vector3d start(0.125, 0.125, 2.125), goal(5.125, 0.125, 2.125);
+  const auto result = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(result.status, Status::Success);
+  EXPECT_EQ(result.path.front(), start);
+  EXPECT_EQ(result.path.back(), goal);
+  EXPECT_EQ(result.path.size(), 21u);
+  EXPECT_NEAR(result.cost, 5.0, 1e-9);
+}
+
+TEST(AStar, StartEqualsGoal)
+{
+  const TestMap map(Occupancy::Free);
+  const Eigen::Vector3d p(1.0, 1.0, 2.0);
+  const auto result = AStarPlanner(AStarPlanner::Params{}).plan(map, p, p);
+  ASSERT_EQ(result.status, Status::Success);
+  EXPECT_EQ(result.path.size(), 2u);
+  EXPECT_DOUBLE_EQ(result.cost, 0.0);
+}
+
+TEST(AStar, GoesThroughGapWithClearance)
+{
+  const TestMap map = wall_with_gap(3);
+  const auto params = wall_params();
+  const auto result = AStarPlanner(params).plan(map, kWallStart, kWallGoal);
+  ASSERT_EQ(result.status, Status::Success);
+  EXPECT_GT(min_clearance(map, result.path), params.inflation_radius);
+  bool crossed_in_gap = false;
+  for (const auto & p : result.path) {
+    EXPECT_TRUE(params.bounds.contains(p));
+    if (map.key(p).x() == 10) {
+      crossed_in_gap |= std::abs(p.y() - 1.125) < 1e-9;  // middle voxel of the gap
+    }
+  }
+  EXPECT_TRUE(crossed_in_gap);
+}
+
+TEST(AStar, GapNarrowerThanInflationIsClosed)
+{
+  // 0.5 m gap: gap voxels are 0.25 m from the wall, < 0.3 m inflation.
+  const TestMap map = wall_with_gap(2);
+  const auto result = AStarPlanner(wall_params()).plan(map, kWallStart, kWallGoal);
+  EXPECT_EQ(result.status, Status::NoPath);
+}
+
+TEST(AStar, CanLeaveStartInsideInflation)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({0.6, -10.0, 0.0}, {0.6, 10.0, 3.0}, Occupancy::Occupied);  // x = 0.5..0.75
+  AStarPlanner::Params params;
+  params.inflation_radius = 0.3;
+  params.bounds = flat_bounds(-3.0, -2.0, 3.0, 2.0);
+  const Eigen::Vector3d start(0.375, 0.125, kLayerZ);  // 0.25 m from the wall
+  const Eigen::Vector3d goal(-2.125, 0.125, kLayerZ);
+  const auto result = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(result.status, Status::Success);
+  EXPECT_GT(min_clearance(map, result.path), params.inflation_radius);
+}
+
+TEST(AStar, UnknownCostTradesDistanceForKnownSpace)
+{
+  // Unknown map with a U-shaped free corridor: 4 m straight through unknown vs ~8 m
+  // around through free space.
+  TestMap map(Occupancy::Unknown);
+  map.set_box({0.1, 0.1, kLayerZ}, {0.1, 2.1, kLayerZ}, Occupancy::Free);
+  map.set_box({0.1, 2.1, kLayerZ}, {4.1, 2.1, kLayerZ}, Occupancy::Free);
+  map.set_box({4.1, 0.1, kLayerZ}, {4.1, 2.1, kLayerZ}, Occupancy::Free);
+  const Eigen::Vector3d start(0.125, 0.125, kLayerZ), goal(4.125, 0.125, kLayerZ);
+
+  AStarPlanner::Params params;
+  params.bounds = flat_bounds(-1.0, -1.0, 5.0, 3.0);
+
+  params.unknown_cost = 0.0;
+  const auto direct = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(direct.status, Status::Success);
+  EXPECT_NEAR(direct.cost, 4.0, 1e-9);
+
+  params.unknown_cost = 10.0;
+  const auto detour = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(detour.status, Status::Success);
+  for (size_t i = 1; i + 1 < detour.path.size(); ++i) {
+    EXPECT_EQ(map.at(map.key(detour.path[i])), Occupancy::Free) << "waypoint " << i;
+  }
+  EXPECT_LT(detour.cost, 8.0);
+}
+
+TEST(AStar, RejectsBadStartAndGoal)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({3.0, 3.0, 2.0}, {3.0, 3.0, 2.0}, Occupancy::Occupied);
+  const AStarPlanner planner(AStarPlanner::Params{});  // z bounds 0.5..5 m
+  const Eigen::Vector3d ok(0.0, 0.0, 2.0);
+  EXPECT_EQ(planner.plan(map, {0, 0, 0.1}, ok).status, Status::StartOutOfBounds);
+  EXPECT_EQ(planner.plan(map, ok, {0, 0, 9.0}).status, Status::GoalOutOfBounds);
+  EXPECT_EQ(planner.plan(map, ok, {3.0, 3.0, 2.0}).status, Status::GoalBlocked);
+  EXPECT_EQ(planner.plan(map, ok, {3.3, 3.0, 2.0}).status, Status::GoalBlocked);  // inflated
+}
+
+TEST(AStar, StopsAtExpansionLimit)
+{
+  const TestMap map(Occupancy::Unknown);
+  AStarPlanner::Params params;
+  params.max_expansions = 50;
+  const auto result = AStarPlanner(params).plan(map, {0, 0, 2}, {40, 40, 2});
+  EXPECT_EQ(result.status, Status::ExpansionLimit);
+  EXPECT_TRUE(result.path.empty());
+}
