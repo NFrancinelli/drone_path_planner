@@ -8,8 +8,8 @@
 namespace trajectory_server
 {
 
-// Everything above the PX4 boundary uses ROS conventions (ENU world, yaw from +x/East, CCW).
-// PX4 uses NED world, yaw from North, CW. These are the only conversion points.
+// ENU <-> NED conversions. ROS side: ENU, yaw from +x (East), CCW.
+// PX4 side: NED, yaw from North, CW. Keep all frame conversions in this file.
 
 inline Eigen::Vector3d enu_to_ned(const Eigen::Vector3d & v)
 {
@@ -45,6 +45,15 @@ inline Eigen::Quaterniond ned_frd_to_enu_flu(const Eigen::Quaterniond & q_ned_fr
   const Eigen::Quaterniond q_enu_ned(0.0, M_SQRT1_2, M_SQRT1_2, 0.0);  // about (x+y)/sqrt2
   const Eigen::Quaterniond q_frd_flu(0.0, 1.0, 0.0, 0.0);              // about x
   return (q_enu_ned * q_ned_frd * q_frd_flu).normalized();
+}
+
+// ROS attitude (body FLU -> world ENU) to PX4 attitude (body FRD -> world NED).
+// Same two fixed rotations, applied on the other sides.
+inline Eigen::Quaterniond enu_flu_to_ned_frd(const Eigen::Quaterniond & q_enu_flu)
+{
+  const Eigen::Quaterniond q_ned_enu(0.0, M_SQRT1_2, M_SQRT1_2, 0.0);
+  const Eigen::Quaterniond q_flu_frd(0.0, 1.0, 0.0, 0.0);
+  return (q_ned_enu * q_enu_flu * q_flu_frd).normalized();
 }
 
 }  // namespace trajectory_server

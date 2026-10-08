@@ -7,18 +7,18 @@
 namespace trajectory_server
 {
 
-// A kinematically consistent sample, in the ENU world frame.
+// One trajectory sample, ENU world frame. vel/acc are the exact derivatives of position.
 struct TrajectoryPoint
 {
   Eigen::Vector3d position{Eigen::Vector3d::Zero()};
   Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
   Eigen::Vector3d acceleration{Eigen::Vector3d::Zero()};
-  double yaw{0.0};
+  double yaw{0.0};       // [rad], ENU: 0 = facing +x (east), counter-clockwise positive
+  double yaw_rate{0.0};  // [rad/s]
 };
 
-// Time-parameterised trajectory starting at t = 0. Sampling outside [0, duration()]
-// clamps to the endpoints, and both endpoints are at rest, so a finished trajectory
-// degrades into a hover at its final point.
+// Trajectory parameterised by time, starting at t = 0. sample() clamps t to [0, duration()]
+// and both endpoints are at rest, so sampling past the end just hovers at the last point.
 class Trajectory
 {
 public:
@@ -48,10 +48,30 @@ private:
   double duration_;
 };
 
-// Horizontal figure-eight (lemniscate of Gerono) around `center`, starting and ending at
-// rest at the center. Angular rate ramps linearly up and down so the acceleration
-// stays bounded at both ends.
+// Rotate in place from one heading to another, quintic in angle, taking the short way round.
+class YawTurn : public Trajectory
+{
+public:
+  YawTurn(const Eigen::Vector3d & position, double from_yaw, double to_yaw, double duration);
+
+  // Shortest duration that respects the given yaw rate and yaw acceleration limits.
+  static double min_duration(double from_yaw, double to_yaw, double max_rate, double max_acc);
+
+  double duration() const override {return duration_;}
+  TrajectoryPoint sample(double t) const override;
+
+private:
+  Eigen::Vector3d position_;
+  double from_yaw_;
+  double delta_;
+  double duration_;
+};
+
+// Horizontal figure-eight (lemniscate of Gerono) around `center`:
 //   x = A sin(phi),  y = B sin(2 phi)
+// Starts and ends at rest at the center; dphi/dt ramps linearly up/down to keep the
+// acceleration bounded. With face_direction, yaw follows the tangent (A cos phi, 2B cos 2phi).
+// The tangent is never zero, so yaw is well defined even at rest.
 class FigureEight : public Trajectory
 {
 public:
@@ -62,9 +82,13 @@ public:
     double loop_period{14.0};  // seconds per loop at cruise rate
     double ramp_time{4.0};     // seconds to reach / leave cruise rate
     int loops{2};
+    bool face_direction{true};  // false: keep the constructor's fixed yaw
   };
 
   FigureEight(const Eigen::Vector3d & center, double yaw, const Params & params);
+
+  // Heading of the path at the start (and end); turn to this before flying it.
+  double start_yaw() const {return sample(0.0).yaw;}
 
   double duration() const override {return duration_;}
   TrajectoryPoint sample(double t) const override;

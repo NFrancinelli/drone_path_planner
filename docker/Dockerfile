@@ -55,6 +55,16 @@ RUN git clone --depth 1 --branch ${PX4_MSGS_BRANCH} \
     && cd /opt/px4_ws && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release \
     && rm -rf build log
 
+# Mapping. Kept after the PX4 layers so adding packages doesn't rebuild PX4.
+RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+        ros-jazzy-octomap-server \
+    && sudo rm -rf /var/lib/apt/lists/*
+
+# The NVIDIA container toolkit mounts libEGL_nvidia but not its glvnd vendor file, so EGL
+# would hand the NVIDIA device to Mesa and Gazebo's headless sensor rendering fails.
+RUN echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+    | sudo tee /usr/share/glvnd/egl_vendor.d/10_nvidia.json >/dev/null
+
 ENV PX4_DIR=/opt/PX4-Autopilot
 RUN echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc \
     && echo "source /opt/px4_ws/install/setup.bash" >> ~/.bashrc \
