@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 #include "trajectory_server/frames.hpp"
 
@@ -154,6 +155,66 @@ TrajectoryPoint FigureEight::sample(double t) const
   } else {
     p.yaw = yaw_;
   }
+  return p;
+}
+
+WaypointTrajectory::WaypointTrajectory(std::vector<Knot> knots, std::vector<double> durations)
+: knots_(std::move(knots)), times_{0.0}
+{
+  if (knots_.size() < 2 || durations.size() != knots_.size() - 1) {
+    throw std::invalid_argument("WaypointTrajectory needs n >= 2 knots and n - 1 durations");
+  }
+  for (const Knot * k : {&knots_.front(), &knots_.back()}) {
+    if (!k->velocity.isZero() || !k->acceleration.isZero()) {
+      throw std::invalid_argument("WaypointTrajectory must start and end at rest");
+    }
+  }
+  for (size_t i = 0; i < durations.size(); ++i) {
+    const double T = durations[i];
+    if (T <= 0.0) {
+      throw std::invalid_argument("WaypointTrajectory durations must be positive");
+    }
+    const Knot & a = knots_[i];
+    const Knot & b = knots_[i + 1];
+    const Eigen::Vector3d dp = b.position - a.position;
+    const double T2 = T * T, T3 = T2 * T;
+    // Quintic Hermite: matches position, velocity and acceleration at both ends.
+    Segment s;
+    s.c[0] = a.position;
+    s.c[1] = a.velocity;
+    s.c[2] = a.acceleration / 2.0;
+    s.c[3] = (20.0 * dp - (8.0 * b.velocity + 12.0 * a.velocity) * T -
+      (3.0 * a.acceleration - b.acceleration) * T2) / (2.0 * T3);
+    s.c[4] = (-30.0 * dp + (14.0 * b.velocity + 16.0 * a.velocity) * T +
+      (3.0 * a.acceleration - 2.0 * b.acceleration) * T2) / (2.0 * T3 * T);
+    s.c[5] = (12.0 * dp - 6.0 * (b.velocity + a.velocity) * T +
+      (b.acceleration - a.acceleration) * T2) / (2.0 * T3 * T2);
+    s.yaw0 = a.yaw;
+    s.dyaw = wrap_angle(b.yaw - a.yaw);
+    segments_.push_back(s);
+    times_.push_back(times_.back() + T);
+  }
+}
+
+TrajectoryPoint WaypointTrajectory::sample(double t) const
+{
+  t = std::clamp(t, 0.0, duration());
+  // Last segment whose start time is <= t.
+  const size_t k = std::min<size_t>(
+    std::upper_bound(times_.begin(), times_.end(), t) - times_.begin() - 1, segments_.size() - 1);
+  const Segment & s = segments_[k];
+  const double T = times_[k + 1] - times_[k];
+  const double u = t - times_[k];
+
+  TrajectoryPoint p;
+  p.position = s.c[0] + u * (s.c[1] + u * (s.c[2] + u * (s.c[3] + u * (s.c[4] + u * s.c[5]))));
+  p.velocity = s.c[1] + u * (2.0 * s.c[2] + u * (3.0 * s.c[3] + u * (4.0 * s.c[4] + u * 5.0 * s.c[5])));
+  p.acceleration = 2.0 * s.c[2] + u * (6.0 * s.c[3] + u * (12.0 * s.c[4] + u * 20.0 * s.c[5]));
+
+  double ys, dys, ddys;
+  quintic(u / T, ys, dys, ddys);
+  p.yaw = wrap_angle(s.yaw0 + s.dyaw * ys);
+  p.yaw_rate = s.dyaw * dys / T;
   return p;
 }
 

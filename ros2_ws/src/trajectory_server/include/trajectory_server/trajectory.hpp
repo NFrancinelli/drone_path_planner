@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -103,6 +104,43 @@ private:
   double omega_;
   double cruise_time_;
   double duration_;
+};
+
+// Piecewise quintic through knots. Each segment is the quintic Hermite interpolant of
+// position, velocity and acceleration at its two knots, so the trajectory is C2 and passes
+// exactly through every knot. Yaw goes from knot to knot on its own quintic, with zero yaw
+// rate at each knot, the short way round. First and last knots must be at rest.
+class WaypointTrajectory : public Trajectory
+{
+public:
+  struct Knot
+  {
+    Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d acceleration{Eigen::Vector3d::Zero()};
+    double yaw{0.0};
+  };
+
+  // durations[k] is the time from knot k to knot k + 1.
+  WaypointTrajectory(std::vector<Knot> knots, std::vector<double> durations);
+
+  double duration() const override {return times_.back();}
+  TrajectoryPoint sample(double t) const override;
+
+  const std::vector<Knot> & knots() const {return knots_;}
+  // Time at which the trajectory passes knot k.
+  double knot_time(size_t k) const {return times_.at(k);}
+
+private:
+  struct Segment
+  {
+    Eigen::Vector3d c[6];  // position polynomial coefficients, c[i] * t^i
+    double yaw0, dyaw;
+  };
+
+  std::vector<Knot> knots_;
+  std::vector<double> times_;  // cumulative, times_[0] = 0
+  std::vector<Segment> segments_;
 };
 
 }  // namespace trajectory_server

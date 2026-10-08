@@ -1,11 +1,14 @@
-// Plans from the drone's current position to a goal on the live OctoMap and publishes the
-// raw A* path. Plans once per goal; no smoothing or execution yet.
+// Plans from the drone's current position to a goal on the live OctoMap: A*, shortcut,
+// then a smooth trajectory. Publishes the raw path and the trajectory for RViz.
+// Plans once per goal; nothing is flown yet.
 //
 // Goals come from RViz's "2D Goal Pose" tool, which sends z = 0, so the goal altitude is a
 // parameter.
 
 #include <chrono>
+#include <cmath>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -21,6 +24,7 @@
 
 #include "path_planner/astar.hpp"
 #include "path_planner/octomap_map.hpp"
+#include "path_planner/smoothing.hpp"
 
 namespace path_planner
 {
@@ -46,12 +50,23 @@ public:
       Eigen::Vector3d(lo.at(0), lo.at(1), lo.at(2)), Eigen::Vector3d(hi.at(0), hi.at(1), hi.at(2)));
     planner_ = std::make_unique<AStarPlanner>(params);
 
+    smoothing_.max_vel = declare_parameter("max_vel", smoothing_.max_vel);
+    smoothing_.max_acc = declare_parameter("max_acc", smoothing_.max_acc);
+    smoothing_.max_yaw_rate = declare_parameter("max_yaw_rate", smoothing_.max_yaw_rate);
+    smoothing_.max_yaw_acc = declare_parameter("max_yaw_acc", smoothing_.max_yaw_acc);
+    smoothing_.collision_radius = declare_parameter("collision_radius", smoothing_.collision_radius);
+    if (smoothing_.collision_radius > params.inflation_radius) {
+      throw std::invalid_argument("collision_radius must not exceed inflation_radius");
+    }
+
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     // Latched so RViz shows the last path even if it subscribes later.
     path_pub_ = create_publisher<nav_msgs::msg::Path>(
       "planned_path", rclcpp::QoS(1).transient_local());
+    smoothed_pub_ = create_publisher<nav_msgs::msg::Path>(
+      "smoothed_path", rclcpp::QoS(1).transient_local());
     // Only the latest map is kept; it's deserialized when a plan is requested.
     map_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
       "octomap_binary", 1,
@@ -112,41 +127,79 @@ private:
       RCLCPP_WARN(get_logger(), "No path from (%.2f, %.2f, %.2f): %s (%d expansions, %.1f ms)",
         start.x(), start.y(), start.z(), AStarPlanner::to_string(result.status),
         result.expansions, ms);
-      publish_path({});  // clear the old one in RViz
+      clear_paths();
       return;
     }
     RCLCPP_INFO(get_logger(), "Path: %zu points, cost %.2f, %d expansions, %.1f ms",
       result.path.size(), result.cost, result.expansions, ms);
-    publish_path(result.path);
+    publish_path(*path_pub_, result.path, {});
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto waypoints = shortcut(
+      map, result.path, planner_->params().inflation_radius, planner_->params().unknown_cost);
+    const auto smoothed = smooth(map, waypoints, smoothing_);
+    const double smooth_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    if (!smoothed.trajectory) {
+      RCLCPP_WARN(get_logger(), "Smoothing failed (%zu waypoints)", waypoints.size());
+      publish_path(*smoothed_pub_, {}, {});
+      return;
+    }
+    const auto & traj = *smoothed.trajectory;
+    RCLCPP_INFO(get_logger(),
+      "Trajectory: %zu waypoints, %d stopped at, %.1f s long, smoothed in %.1f ms",
+      waypoints.size(), smoothed.stopped_knots, traj.duration(), smooth_ms);
+    std::vector<Eigen::Vector3d> points;
+    std::vector<double> yaws;
+    for (double t = 0.0; t < traj.duration(); t += 0.1) {
+      const auto sp = traj.sample(t);
+      points.push_back(sp.position);
+      yaws.push_back(sp.yaw);
+    }
+    points.push_back(traj.sample(traj.duration()).position);
+    yaws.push_back(traj.sample(traj.duration()).yaw);
+    publish_path(*smoothed_pub_, points, yaws);
   }
 
-  void publish_path(const std::vector<Eigen::Vector3d> & points)
+  void clear_paths()
+  {
+    publish_path(*path_pub_, {}, {});
+    publish_path(*smoothed_pub_, {}, {});
+  }
+
+  // yaws: one per point, or empty for identity orientations.
+  void publish_path(
+    rclcpp::Publisher<nav_msgs::msg::Path> & pub, const std::vector<Eigen::Vector3d> & points,
+    const std::vector<double> & yaws)
   {
     nav_msgs::msg::Path path;
     path.header.stamp = now();
     path.header.frame_id = world_frame_;
-    for (const auto & p : points) {
+    for (size_t i = 0; i < points.size(); ++i) {
       geometry_msgs::msg::PoseStamped pose;
       pose.header = path.header;
-      pose.pose.position.x = p.x();
-      pose.pose.position.y = p.y();
-      pose.pose.position.z = p.z();
-      pose.pose.orientation.w = 1.0;
+      pose.pose.position.x = points[i].x();
+      pose.pose.position.y = points[i].y();
+      pose.pose.position.z = points[i].z();
+      const double yaw = yaws.empty() ? 0.0 : yaws[i];
+      pose.pose.orientation.z = std::sin(yaw / 2.0);
+      pose.pose.orientation.w = std::cos(yaw / 2.0);
       path.poses.push_back(pose);
     }
-    path_pub_->publish(path);
+    pub.publish(path);
   }
 
   std::string world_frame_, body_frame_;
   double goal_altitude_;
   std::unique_ptr<AStarPlanner> planner_;
+  SmoothingParams smoothing_;
   octomap_msgs::msg::Octomap::ConstSharedPtr map_msg_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, smoothed_pub_;
 };
 
 }  // namespace path_planner

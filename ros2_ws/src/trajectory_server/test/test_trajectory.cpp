@@ -8,6 +8,7 @@
 using trajectory_server::FigureEight;
 using trajectory_server::QuinticLine;
 using trajectory_server::Trajectory;
+using trajectory_server::WaypointTrajectory;
 using trajectory_server::YawTurn;
 using trajectory_server::wrap_angle;
 
@@ -211,4 +212,93 @@ TEST(FigureEight, RejectsRampLongerThanMission)
   params.loop_period = 4.0;
   params.ramp_time = 10.0;
   EXPECT_THROW(FigureEight({0, 0, 0}, 0.0, params), std::invalid_argument);
+}
+
+namespace
+{
+
+// L-shaped path with a moving knot at the corner and a climb on the last leg.
+WaypointTrajectory corner_trajectory()
+{
+  std::vector<WaypointTrajectory::Knot> knots(4);
+  knots[0].position = {0, 0, 2};
+  knots[1].position = {3, 0, 2};
+  knots[1].velocity = {0.5, 0.5, 0};
+  knots[1].yaw = M_PI_2;
+  knots[2].position = {3, 3, 2.5};
+  knots[2].velocity = {0, 0.6, 0.1};
+  knots[2].acceleration = {0.1, 0, 0};
+  knots[2].yaw = M_PI_2;
+  knots[3].position = {3, 5, 3};
+  knots[3].yaw = 3.0;
+  return WaypointTrajectory(knots, {4.0, 4.5, 3.0});
+}
+
+}  // namespace
+
+TEST(WaypointTrajectory, PassesThroughKnotsWithTheirDerivatives)
+{
+  const auto traj = corner_trajectory();
+  EXPECT_DOUBLE_EQ(traj.duration(), 11.5);
+  for (size_t k = 0; k < traj.knots().size(); ++k) {
+    const auto & knot = traj.knots()[k];
+    const auto p = traj.sample(traj.knot_time(k));
+    EXPECT_LT((p.position - knot.position).norm(), 1e-9) << "knot " << k;
+    EXPECT_LT((p.velocity - knot.velocity).norm(), 1e-9) << "knot " << k;
+    EXPECT_LT((p.acceleration - knot.acceleration).norm(), 1e-9) << "knot " << k;
+    EXPECT_NEAR(wrap_angle(p.yaw - knot.yaw), 0.0, 1e-9) << "knot " << k;
+    EXPECT_NEAR(p.yaw_rate, 0.0, 1e-9) << "knot " << k;
+  }
+  expect_at_rest(traj, 0.0);
+  expect_at_rest(traj, traj.duration());
+  EXPECT_LT((traj.sample(100.0).position - Eigen::Vector3d(3, 5, 3)).norm(), 1e-9);
+}
+
+TEST(WaypointTrajectory, ContinuousAcrossKnots)
+{
+  const auto traj = corner_trajectory();
+  expect_consistent_derivatives(traj);
+  for (size_t k = 1; k + 1 < traj.knots().size(); ++k) {
+    const double t = traj.knot_time(k);
+    const auto before = traj.sample(t - 1e-7), after = traj.sample(t + 1e-7);
+    EXPECT_LT((before.velocity - after.velocity).norm(), 1e-5);
+    EXPECT_LT((before.acceleration - after.acceleration).norm(), 1e-5);
+  }
+}
+
+TEST(WaypointTrajectory, StaysOnSegmentsWhenStoppingAtKnots)
+{
+  std::vector<WaypointTrajectory::Knot> knots(3);
+  knots[0].position = {0, 0, 1};
+  knots[1].position = {2, 1, 1};
+  knots[2].position = {2, 4, 2};
+  const WaypointTrajectory traj(knots, {3.0, 4.0});
+  for (double t = 0; t <= traj.duration(); t += 0.05) {
+    const Eigen::Vector3d p = traj.sample(t).position;
+    const size_t k = t < 3.0 ? 0 : 1;
+    const Eigen::Vector3d a = knots[k].position, d = (knots[k + 1].position - a).normalized();
+    EXPECT_LT(((p - a) - (p - a).dot(d) * d).norm(), 1e-9) << "t = " << t;
+  }
+}
+
+TEST(WaypointTrajectory, YawTakesTheShortWayBetweenKnots)
+{
+  std::vector<WaypointTrajectory::Knot> knots(2);
+  knots[1].position = {1, 0, 0};
+  knots[0].yaw = 3.0;
+  knots[1].yaw = -3.0;
+  const WaypointTrajectory traj(knots, {2.0});
+  for (double t = 0; t <= 2.0; t += 0.01) {
+    EXPECT_GE(traj.sample(t).yaw_rate, 0.0);
+  }
+}
+
+TEST(WaypointTrajectory, RejectsBadInput)
+{
+  std::vector<WaypointTrajectory::Knot> knots(2);
+  knots[1].position = {1, 0, 0};
+  EXPECT_THROW(WaypointTrajectory(knots, {}), std::invalid_argument);
+  EXPECT_THROW(WaypointTrajectory(knots, {0.0}), std::invalid_argument);
+  knots[1].velocity = {0.1, 0, 0};
+  EXPECT_THROW(WaypointTrajectory(knots, {1.0}), std::invalid_argument);
 }

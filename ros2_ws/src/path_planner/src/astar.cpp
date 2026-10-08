@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "path_planner/inflated_map.hpp"
+
 namespace path_planner
 {
 
@@ -32,24 +34,6 @@ std::vector<Step> make_neighbours()
     }
   }
   return steps;
-}
-
-// Offsets to every voxel whose center is within `radius` of the origin voxel's center.
-std::vector<Key> make_kernel(double radius, double resolution)
-{
-  std::vector<Key> kernel;
-  const int r = static_cast<int>(std::ceil(radius / resolution));
-  for (int dx = -r; dx <= r; ++dx) {
-    for (int dy = -r; dy <= r; ++dy) {
-      for (int dz = -r; dz <= r; ++dz) {
-        const Key d(dx, dy, dz);
-        if (d.cast<double>().norm() * resolution <= radius) {
-          kernel.push_back(d);
-        }
-      }
-    }
-  }
-  return kernel;
 }
 
 struct OpenEntry
@@ -95,20 +79,8 @@ AStarPlanner::Result AStarPlanner::plan(
     return result;
   }
 
-  // Inflation computed on demand and cached.
-  const std::vector<Key> kernel = make_kernel(p_.inflation_radius, res);
-  std::unordered_map<Key, bool, KeyHash> blocked_cache;
-  const auto blocked = [&](const Key & k) {
-      auto [it, inserted] = blocked_cache.try_emplace(k, false);
-      if (inserted) {
-        it->second = std::any_of(kernel.begin(), kernel.end(), [&](const Key & d) {
-              return map.at(k + d) == Occupancy::Occupied;
-            });
-      }
-      return it->second;
-    };
-
-  if (blocked(goal_key)) {
+  const InflatedMap inflated(map, p_.inflation_radius);
+  if (inflated.blocked(goal_key)) {
     result.status = Status::GoalBlocked;
     return result;
   }
@@ -152,7 +124,7 @@ AStarPlanner::Result AStarPlanner::plan(
 
     for (const Step & step : kNeighbours) {
       const Key next = node.key + step.offset;
-      if (closed.count(next) || !in_bounds(next) || blocked(next)) {
+      if (closed.count(next) || !in_bounds(next) || inflated.blocked(next)) {
         continue;
       }
       const double weight = map.at(next) == Occupancy::Unknown ? 1.0 + p_.unknown_cost : 1.0;
