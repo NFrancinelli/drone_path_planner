@@ -1,9 +1,8 @@
 // Streams trajectory setpoints to PX4 in offboard mode.
 //
-// Milestone 1 ("hello world"): a scripted mission that exercises the full PX4 offboard
-// pipeline: wait for PX4, pre-stream setpoints, switch to offboard, arm, take off,
-// fly a figure-eight, land. The planner will later replace the scripted figure-eight
-// with trajectories received over a topic; the streaming/hold logic stays the same.
+// For now this runs a hardcoded mission: wait for PX4, pre-stream setpoints, switch to
+// offboard, arm, take off, fly a figure-eight, land.
+// TODO: take trajectories from the planner over a topic instead of the scripted figure-eight.
 
 #include <algorithm>
 #include <chrono>
@@ -44,6 +43,8 @@ public:
     takeoff_altitude_ = declare_parameter("takeoff_altitude", 2.5);
     max_vel_ = declare_parameter("max_vel", 1.0);
     max_acc_ = declare_parameter("max_acc", 1.0);
+    max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
+    max_yaw_acc_ = declare_parameter("max_yaw_acc", 1.0);
     world_frame_ = declare_parameter("world_frame", std::string("odom"));
     prestream_time_ = declare_parameter("prestream_time", 1.0);
     hover_time_ = declare_parameter("hover_time", 2.0);
@@ -52,6 +53,7 @@ public:
     fig8_.loop_period = declare_parameter("figure_eight.loop_period", fig8_.loop_period);
     fig8_.ramp_time = declare_parameter("figure_eight.ramp_time", fig8_.ramp_time);
     fig8_.loops = static_cast<int>(declare_parameter("figure_eight.loops", 2));
+    fig8_.face_direction = declare_parameter("figure_eight.face_direction", true);
 
     const auto status_topic =
       declare_parameter("status_topic", std::string("/fmu/out/vehicle_status_v1"));
@@ -79,7 +81,7 @@ public:
   }
 
 private:
-  enum class State { WaitForPx4, Prestream, Engaging, Takeoff, Hover, FigureEight, Landing, Done };
+  enum class State { WaitForPx4, Prestream, Engaging, Takeoff, Hover, Turn, FigureEight, Landing, Done };
 
   static const char * name(State s)
   {
@@ -89,6 +91,7 @@ private:
       case State::Engaging: return "ENGAGING";
       case State::Takeoff: return "TAKEOFF";
       case State::Hover: return "HOVER";
+      case State::Turn: return "TURN";
       case State::FigureEight: return "FIGURE_EIGHT";
       case State::Landing: return "LANDING";
       case State::Done: return "DONE";
@@ -141,7 +144,19 @@ private:
 
       case State::Hover:
         if (t > hover_time_) {
-          follow(std::make_shared<FigureEight>(hold_point_.position, hold_point_.yaw, fig8_));
+          // Face along the path before moving, so the heading doesn't jump at the start.
+          figure_eight_ = std::make_shared<FigureEight>(
+            hold_point_.position, hold_point_.yaw, fig8_);
+          const double from = hold_point_.yaw, to = figure_eight_->start_yaw();
+          follow(std::make_shared<YawTurn>(hold_point_.position, from, to,
+            YawTurn::min_duration(from, to, max_yaw_rate_, max_yaw_acc_)));
+          transition(State::Turn);
+        }
+        break;
+
+      case State::Turn:
+        if (trajectory_finished()) {
+          follow(figure_eight_);
           RCLCPP_INFO(get_logger(), "Figure-eight: %.1f s", trajectory_->duration());
           transition(State::FigureEight);
         }
@@ -174,10 +189,12 @@ private:
 
   // --- PX4 state ---------------------------------------------------------------------
 
+  // Offboard only needs a local position. Don't wait for pre_flight_checks_pass: it means
+  // "can arm in the current mode", and PX4 boots into Hold, which needs a global (GPS)
+  // position we don't have with mocap. Real arming refusals surface as the ENGAGING timeout.
   bool px4_ready() const
   {
-    return status_ && position_ && position_->xy_valid && position_->z_valid &&
-           status_->pre_flight_checks_pass;
+    return status_ && position_ && position_->xy_valid && position_->z_valid;
   }
 
   bool offboard() const
@@ -257,7 +274,9 @@ private:
 
   // --- PX4 output ----------------------------------------------------------------------
 
-  uint64_t timestamp_us() const {return get_clock()->now().nanoseconds() / 1000;}
+  // PX4 converts incoming timestamps from the XRCE agent's system clock to its own, so these
+  // must be system time even when the node runs on simulation time.
+  uint64_t timestamp_us() {return system_clock_.now().nanoseconds() / 1000;}
 
   void publish_setpoint(const TrajectoryPoint & sp)
   {
@@ -279,7 +298,7 @@ private:
     const float nan = std::numeric_limits<float>::quiet_NaN();
     msg.jerk = {nan, nan, nan};
     msg.yaw = static_cast<float>(enu_yaw_to_ned(sp.yaw));
-    msg.yawspeed = nan;
+    msg.yawspeed = static_cast<float>(-sp.yaw_rate);  // ENU counter-clockwise -> NED clockwise
     setpoint_pub_->publish(msg);
   }
 
@@ -312,6 +331,7 @@ private:
 
   // Parameters
   double rate_hz_, takeoff_altitude_, max_vel_, max_acc_, prestream_time_, hover_time_;
+  double max_yaw_rate_, max_yaw_acc_;
   std::string world_frame_;
   FigureEight::Params fig8_;
 
@@ -324,6 +344,7 @@ private:
   rclcpp::Time state_entered_{now()};
   double last_command_time_{-std::numeric_limits<double>::infinity()};
   TrajectoryPtr trajectory_;
+  std::shared_ptr<const FigureEight> figure_eight_;
   rclcpp::Time trajectory_start_{now()};
   TrajectoryPoint hold_point_;
 
@@ -334,6 +355,7 @@ private:
   rclcpp::Publisher<VehicleCommand>::SharedPtr command_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Clock system_clock_{RCL_SYSTEM_TIME};
 };
 
 }  // namespace trajectory_server

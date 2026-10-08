@@ -3,7 +3,7 @@
 <package format="3">
   <name>px4_state_bridge</name>
   <version>0.1.0</version>
-  <description>Republishes PX4 vehicle state as standard ROS odometry, TF and visualization markers (ENU/FLU).</description>
+  <description>Bridges PX4 and ROS state: PX4 odometry to ROS odometry/TF/markers (ENU/FLU), and a ground-truth pose to PX4 as external vision (simulated motion capture).</description>
   <maintainer email="francinelli.nicolas@gmail.com">Nicolas Francinelli</maintainer>
   <license>MIT</license>
 

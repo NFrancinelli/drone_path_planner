@@ -16,11 +16,17 @@ find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(trajectory_server REQUIRED)
 
+include_directories(include)
+
 add_executable(px4_state_bridge_node src/px4_state_bridge_node.cpp)
 target_link_libraries(px4_state_bridge_node trajectory_server::trajectory_core)
 ament_target_dependencies(px4_state_bridge_node
   rclcpp px4_msgs nav_msgs geometry_msgs visualization_msgs tf2_ros)
 
-install(TARGETS px4_state_bridge_node DESTINATION lib/${PROJECT_NAME})
+add_executable(mocap_bridge_node src/mocap_bridge_node.cpp)
+target_link_libraries(mocap_bridge_node trajectory_server::trajectory_core)
+ament_target_dependencies(mocap_bridge_node rclcpp px4_msgs nav_msgs geometry_msgs tf2_ros)
+
+install(TARGETS px4_state_bridge_node mocap_bridge_node DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

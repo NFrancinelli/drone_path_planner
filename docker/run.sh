@@ -13,7 +13,7 @@ GPU_ARGS=()
 if docker info 2>/dev/null | grep -q 'Runtimes:.*nvidia'; then
     GPU_ARGS=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all)
 fi
-# Mesa GPUs (e.g. the Intel iGPU driving the screen on hybrid laptops): RViz renders here.
+# Pass /dev/dri through for Mesa GPUs (e.g. Intel iGPU on hybrid laptops), RViz renders on it.
 if [ -d /dev/dri ]; then
     GPU_ARGS+=(--device /dev/dri)
     for group in video render; do

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PX4 x500 + one low-res forward depth camera (no RGB), pitched up 12 deg to see where
+  the drone is climbing.
+  The camera pose must match the base_link -> camera_link TF in drone_bringup/sim.launch.py.
+-->
+<sdf version="1.9">
+  <model name="x500_depth_lite">
+    <include merge="true">
+      <uri>model://x500</uri>
+    </include>
+
+    <link name="camera_link">
+      <pose relative_to="base_link">0.12 0 0.03 0 -0.2094 0</pose>
+      <inertial>
+        <mass>0.02</mass>
+        <inertia>
+          <ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="camera_visual">
+        <geometry>
+          <box><size>0.025 0.09 0.025</size></box>
+        </geometry>
+      </visual>
+      <sensor name="depth_camera" type="depth_camera">
+        <gz_frame_id>camera_link</gz_frame_id>
+        <camera>
+          <horizontal_fov>1.51</horizontal_fov>  <!-- ~87 deg, RealSense-like -->
+          <image>
+            <width>320</width>
+            <height>240</height>
+            <format>R_FLOAT32</format>
+          </image>
+          <clip>
+            <!-- The front propeller tips sweep through the image corners ~0.27 m away and
+                 would be mapped as obstacles; real depth cameras can't see that close anyway. -->
+            <near>0.4</near>
+            <far>10.0</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>10</update_rate>
+        <visualize>false</visualize>
+        <topic>depth_camera</topic>
+      </sensor>
+    </link>
+
+    <joint name="camera_joint" type="fixed">
+      <parent>base_link</parent>
+      <child>camera_link</child>
+    </joint>
+
+    <!-- Ground-truth pose on /model/<name>/odometry. Feeds the mocap bridge and is used as
+         reference when checking PX4's estimate. -->
+    <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
+      <dimensions>3</dimensions>
+      <odom_publish_frequency>50</odom_publish_frequency>
+      <odom_frame>odom</odom_frame>
+      <robot_base_frame>base_link</robot_base_frame>
+    </plugin>
+  </model>
+</sdf>

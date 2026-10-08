@@ -1,7 +1,7 @@
-// Republishes PX4's vehicle state in standard ROS form (ENU/FLU):
+// Republishes PX4 vehicle odometry as ROS ENU/FLU:
 //   /odom (nav_msgs/Odometry), TF odom -> base_link, /trail (nav_msgs/Path),
-//   /drone_model (visualization_msgs/MarkerArray, a simple quadrotor drawn in base_link).
-// The TF is also what the mapping stack will use to place depth points in the world.
+//   /drone_model (MarkerArray, simple quad drawn in base_link).
+// OctoMap uses this TF to place depth points (unless the mocap bridge publishes it).
 
 #include <cmath>
 #include <memory>
@@ -15,6 +15,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include "px4_state_bridge/px4_time.hpp"
 #include "trajectory_server/frames.hpp"
 
 using px4_msgs::msg::VehicleOdometry;
@@ -33,6 +34,8 @@ public:
     body_frame_ = declare_parameter("body_frame", std::string("base_link"));
     trail_spacing_ = declare_parameter("trail_spacing", 0.05);
     trail_max_points_ = static_cast<size_t>(declare_parameter("trail_max_points", 5000));
+    // Off when another source owns odom -> base_link (the mocap bridge in mocap mode).
+    publish_tf_ = declare_parameter("publish_tf", true);
 
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("odom", 10);
     trail_pub_ = create_publisher<nav_msgs::msg::Path>("trail", 10);
@@ -65,7 +68,12 @@ private:
     const Eigen::Quaterniond q = trajectory_server::ned_frd_to_enu_flu(
       Eigen::Quaterniond(msg.q[0], msg.q[1], msg.q[2], msg.q[3]));
 
-    const auto stamp = now();
+    if (!px4_time_.ready()) {
+      return;
+    }
+    // Use PX4's sample time, not arrival time, otherwise TF lags the depth clouds and
+    // obstacles get smeared in the map.
+    const auto stamp = px4_time_.to_ros(msg.timestamp_sample);
     geometry_msgs::msg::TransformStamped tf;
     tf.header.stamp = stamp;
     tf.header.frame_id = world_frame_;
@@ -77,7 +85,9 @@ private:
     tf.transform.rotation.x = q.x();
     tf.transform.rotation.y = q.y();
     tf.transform.rotation.z = q.z();
-    tf_broadcaster_->sendTransform(tf);
+    if (publish_tf_) {
+      tf_broadcaster_->sendTransform(tf);
+    }
 
     nav_msgs::msg::Odometry odom;
     odom.header = tf.header;
@@ -161,6 +171,7 @@ private:
 
   std::string world_frame_, body_frame_;
   double trail_spacing_;
+  bool publish_tf_;
   size_t trail_max_points_;
   nav_msgs::msg::Path trail_;
   Eigen::Vector3d last_trail_point_{Eigen::Vector3d::Zero()};
@@ -170,6 +181,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trail_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr model_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  Px4Time px4_time_{*this};
   rclcpp::TimerBase::SharedPtr trail_timer_, model_timer_;
 };
 

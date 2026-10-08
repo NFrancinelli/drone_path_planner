@@ -8,6 +8,8 @@
 using trajectory_server::FigureEight;
 using trajectory_server::QuinticLine;
 using trajectory_server::Trajectory;
+using trajectory_server::YawTurn;
+using trajectory_server::wrap_angle;
 
 namespace
 {
@@ -23,8 +25,10 @@ void expect_consistent_derivatives(const Trajectory & traj)
     const auto after = traj.sample(t + h);
     const Eigen::Vector3d num_vel = (after.position - before.position) / (2 * h);
     const Eigen::Vector3d num_acc = (after.velocity - before.velocity) / (2 * h);
+    const double num_yaw_rate = wrap_angle(after.yaw - before.yaw) / (2 * h);
     EXPECT_LT((num_vel - p.velocity).norm(), 1e-4) << "t = " << t;
     EXPECT_LT((num_acc - p.acceleration).norm(), 1e-3) << "t = " << t;
+    EXPECT_NEAR(num_yaw_rate, p.yaw_rate, 1e-4) << "t = " << t;
   }
 }
 
@@ -32,6 +36,7 @@ void expect_at_rest(const Trajectory & traj, double t)
 {
   const auto p = traj.sample(t);
   EXPECT_LT(p.velocity.norm(), 1e-9) << "t = " << t;
+  EXPECT_LT(std::abs(p.yaw_rate), 1e-9) << "t = " << t;
 }
 
 }  // namespace
@@ -81,6 +86,17 @@ TEST(Frames, AttitudeMatchesPositionAndYawConventions)
   }
 }
 
+TEST(Frames, AttitudeRoundTrip)
+{
+  const Eigen::Quaterniond q_ned_frd = Eigen::Quaterniond(
+    Eigen::AngleAxisd(1.1, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(-0.3, Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(0.2, Eigen::Vector3d::UnitX()));
+  const Eigen::Quaterniond back = trajectory_server::enu_flu_to_ned_frd(
+    trajectory_server::ned_frd_to_enu_flu(q_ned_frd));
+  EXPECT_NEAR(std::abs(back.dot(q_ned_frd)), 1.0, 1e-12);  // q and -q are the same rotation
+}
+
 TEST(QuinticLine, EndpointsAndDerivatives)
 {
   const Eigen::Vector3d from(0, 0, 0), to(1, 2, 3);
@@ -127,6 +143,64 @@ TEST(FigureEight, StaysAtAltitudeAndInsideBounds)
     EXPECT_DOUBLE_EQ(p.position.z(), 2.0);
     EXPECT_LE(std::abs(p.position.x()), 3.0 + 1e-9);
     EXPECT_LE(std::abs(p.position.y()), 1.5 + 1e-9);
+  }
+}
+
+TEST(YawTurn, TakesTheShortWayAround)
+{
+  // From +172 deg to -172 deg is a 16 deg left turn through 180, not 344 deg to the right.
+  const YawTurn turn({1, 2, 3}, 3.0, -3.0, 2.0);
+  EXPECT_NEAR(turn.sample(0.0).yaw, 3.0, 1e-12);
+  EXPECT_NEAR(wrap_angle(turn.sample(2.0).yaw - (-3.0)), 0.0, 1e-12);
+  for (double t = 0; t <= 2.0; t += 0.01) {
+    const auto p = turn.sample(t);
+    EXPECT_GE(p.yaw_rate, 0.0);  // counter-clockwise the whole way
+    EXPECT_EQ(p.position, Eigen::Vector3d(1, 2, 3));
+    EXPECT_LT(p.velocity.norm(), 1e-12);
+  }
+  expect_at_rest(turn, 0.0);
+  expect_at_rest(turn, 2.0);
+  expect_consistent_derivatives(turn);
+}
+
+TEST(YawTurn, MinDurationRespectsLimits)
+{
+  const double max_rate = 0.8, max_acc = 1.0;
+  const double duration = YawTurn::min_duration(0.0, 2.5, max_rate, max_acc);
+  const YawTurn turn({0, 0, 0}, 0.0, 2.5, duration);
+  for (double t = 0; t <= duration; t += duration / 500.0) {
+    EXPECT_LE(std::abs(turn.sample(t).yaw_rate), max_rate + 1e-9);
+  }
+}
+
+TEST(FigureEight, FacesDirectionOfTravel)
+{
+  FigureEight::Params params;
+  params.half_length = 3.0;
+  params.half_width = 1.5;
+  const FigureEight fig({0, 0, 2}, 0.0, params);
+  // Starts heading along (A, 2B), i.e. 45 deg for A = 2B.
+  EXPECT_NEAR(fig.start_yaw(), std::atan2(2 * 1.5, 3.0), 1e-12);
+  int checked = 0;
+  for (double t = 0; t <= fig.duration(); t += 0.05) {
+    const auto p = fig.sample(t);
+    if (p.velocity.head<2>().norm() > 0.05) {
+      const double heading = std::atan2(p.velocity.y(), p.velocity.x());
+      EXPECT_NEAR(wrap_angle(p.yaw - heading), 0.0, 1e-9) << "t = " << t;
+      ++checked;
+    }
+  }
+  EXPECT_GT(checked, 400);
+}
+
+TEST(FigureEight, FixedYawWhenNotFacingDirection)
+{
+  FigureEight::Params params;
+  params.face_direction = false;
+  const FigureEight fig({0, 0, 2}, 0.7, params);
+  for (double t = 0; t <= fig.duration(); t += 0.5) {
+    EXPECT_DOUBLE_EQ(fig.sample(t).yaw, 0.7);
+    EXPECT_DOUBLE_EQ(fig.sample(t).yaw_rate, 0.0);
   }
 }
 
