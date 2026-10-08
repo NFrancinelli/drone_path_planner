@@ -48,6 +48,8 @@ public:
     world_frame_ = declare_parameter("world_frame", std::string("odom"));
     prestream_time_ = declare_parameter("prestream_time", 1.0);
     hover_time_ = declare_parameter("hover_time", 2.0);
+    // false: take off and hold position (for testing the planner).
+    fly_figure_eight_ = declare_parameter("figure_eight.enabled", true);
     fig8_.half_length = declare_parameter("figure_eight.half_length", fig8_.half_length);
     fig8_.half_width = declare_parameter("figure_eight.half_width", fig8_.half_width);
     fig8_.loop_period = declare_parameter("figure_eight.loop_period", fig8_.loop_period);
@@ -143,7 +145,7 @@ private:
         break;
 
       case State::Hover:
-        if (t > hover_time_) {
+        if (fly_figure_eight_ && t > hover_time_) {
           // Face along the path before moving, so the heading doesn't jump at the start.
           figure_eight_ = std::make_shared<FigureEight>(
             hold_point_.position, hold_point_.yaw, fig8_);
@@ -332,6 +334,7 @@ private:
   // Parameters
   double rate_hz_, takeoff_altitude_, max_vel_, max_acc_, prestream_time_, hover_time_;
   double max_yaw_rate_, max_yaw_acc_;
+  bool fly_figure_eight_;
   std::string world_frame_;
   FigureEight::Params fig8_;
 

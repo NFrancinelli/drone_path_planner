@@ -3,13 +3,19 @@
 <package format="3">
   <name>path_planner</name>
   <version>0.1.0</version>
-  <description>A* path planner on a 3D voxel map, with a tunable cost for flying through unknown space.</description>
+  <description>A* path planner on a live OctoMap, with a tunable cost for flying through unknown space.</description>
   <maintainer email="francinelli.nicolas@gmail.com">Nicolas Francinelli</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>eigen</depend>
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>octomap</depend>
+  <depend>octomap_msgs</depend>
+  <depend>tf2_ros</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 
