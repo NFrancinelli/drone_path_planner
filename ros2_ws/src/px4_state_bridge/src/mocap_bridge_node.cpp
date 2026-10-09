@@ -1,7 +1,8 @@
 // Fake mocap: forwards the Gazebo ground-truth pose (nav_msgs/Odometry, ENU/FLU) to PX4 as
 // external vision (VehicleOdometry, NED/FRD), same as a Vicon/OptiTrack setup.
 // EKF2 is configured to fuse only EV position + yaw (GPS/mag/baro off, see sim.launch.py),
-// so PX4's estimate matches ground truth and the map and controller agree on the frame.
+// so PX4's estimate tracks ground truth. Its local frame is shifted by a constant though
+// (height origin at the drone resting on the ground); the trajectory server compensates.
 // Also publishes odom -> base_link TF from these poses. They have exact sim-time stamps,
 // which keeps depth clouds aligned with the pose during fast turns.
 

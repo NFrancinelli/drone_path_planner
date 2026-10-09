@@ -107,7 +107,7 @@ TEST(Shortcut, StraightensZigZagInFreeSpace)
 {
   const TestMap map(Occupancy::Free);
   const Path zigzag{{0, 0, 2}, {0.5, 0.5, 2}, {1, 0, 2}, {1.5, 0.5, 2}, {2, 0, 2}};
-  const Path out = shortcut(map, zigzag, 0.5, 1.0);
+  const Path out = shortcut(map, zigzag, AStarPlanner::Params{});
   ASSERT_EQ(out.size(), 2u);
   EXPECT_EQ(out.front(), zigzag.front());
   EXPECT_EQ(out.back(), zigzag.back());
@@ -123,7 +123,7 @@ TEST(Shortcut, KeepsClearanceThroughGap)
   const auto raw = AStarPlanner(params).plan(map, start, goal);
   ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
 
-  const Path out = shortcut(map, raw.path, params.inflation_radius, params.unknown_cost);
+  const Path out = shortcut(map, raw.path, params);
   EXPECT_LT(out.size(), raw.path.size());
   EXPECT_LE(out.size(), 5u);
   EXPECT_EQ(out.front(), start);
@@ -148,7 +148,7 @@ TEST(Shortcut, DoesNotCutThroughUnknownTheSearchAvoided)
   const auto raw = AStarPlanner(params).plan(map, {0.125, 0.125, kLayerZ}, {4.125, 0.125, kLayerZ});
   ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
 
-  const Path out = shortcut(map, raw.path, params.inflation_radius, params.unknown_cost);
+  const Path out = shortcut(map, raw.path, params);
   EXPECT_LT(out.size(), raw.path.size());
   for (const auto & p : densify(map, out)) {
     EXPECT_EQ(map.at(map.key(p)), Occupancy::Free) << p.transpose();

@@ -17,6 +17,7 @@ find_package(rclcpp REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(drone_interfaces REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 # ROS-independent core: trajectories and frame conversions.
@@ -28,7 +29,8 @@ target_link_libraries(trajectory_core PUBLIC Eigen3::Eigen)
 
 add_executable(trajectory_server_node src/trajectory_server_node.cpp)
 target_link_libraries(trajectory_server_node trajectory_core)
-ament_target_dependencies(trajectory_server_node rclcpp px4_msgs nav_msgs drone_interfaces)
+ament_target_dependencies(trajectory_server_node
+  rclcpp px4_msgs nav_msgs drone_interfaces tf2_ros)
 
 install(TARGETS trajectory_core EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)

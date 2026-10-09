@@ -19,6 +19,7 @@ struct Step
 {
   Key offset;
   double length;  // in voxels
+  double climb;   // |dz| in voxels
 };
 
 std::vector<Step> make_neighbours()
@@ -28,7 +29,8 @@ std::vector<Step> make_neighbours()
     for (int dy = -1; dy <= 1; ++dy) {
       for (int dz = -1; dz <= 1; ++dz) {
         if (dx != 0 || dy != 0 || dz != 0) {
-          steps.push_back({Key(dx, dy, dz), std::sqrt(double(dx * dx + dy * dy + dz * dz))});
+          steps.push_back(
+            {Key(dx, dy, dz), std::sqrt(double(dx * dx + dy * dy + dz * dz)), double(std::abs(dz))});
         }
       }
     }
@@ -85,8 +87,12 @@ AStarPlanner::Result AStarPlanner::plan(
     return result;
   }
 
-  // Euclidean, admissible since a step never costs less than its length.
-  const auto heuristic = [&](const Key & k) {return (goal_key - k).cast<double>().norm() * res;};
+  // Euclidean plus the height change still to go: admissible, since every path covers at
+  // least that distance and that height change, at no less than these costs.
+  const auto heuristic = [&](const Key & k) {
+      const Key d = goal_key - k;
+      return (d.cast<double>().norm() + p_.vertical_cost * std::abs(d.z())) * res;
+    };
 
   std::priority_queue<OpenEntry, std::vector<OpenEntry>, OpenCompare> open;
   std::unordered_map<Key, double, KeyHash> g{{start_key, 0.0}};
@@ -128,7 +134,7 @@ AStarPlanner::Result AStarPlanner::plan(
         continue;
       }
       const double weight = map.at(next) == Occupancy::Unknown ? 1.0 + p_.unknown_cost : 1.0;
-      const double cost = node.g + step.length * res * weight;
+      const double cost = node.g + (step.length * weight + p_.vertical_cost * step.climb) * res;
       auto [it, inserted] = g.try_emplace(next, cost);
       if (!inserted && cost >= it->second) {
         continue;

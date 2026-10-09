@@ -12,8 +12,11 @@ namespace path_planner
 
 // 26-connected A* on the map's voxel grid.
 // A voxel is blocked if an occupied voxel center is within inflation_radius of its center.
-// Unknown voxels cost (1 + unknown_cost) per metre. The search is clamped to `bounds`,
-// which also keeps it from expanding forever into unknown space.
+// Unknown voxels cost (1 + unknown_cost) per metre. Climbing or descending costs an extra
+// vertical_cost per metre of height change, so the drone keeps its altitude unless a climb
+// actually pays off; without it, paths wander up and down between near-equal options.
+// The search is clamped to `bounds`, which also keeps it from expanding forever into
+// unknown space.
 class AStarPlanner
 {
 public:
@@ -21,6 +24,7 @@ public:
   {
     double inflation_radius{0.5};  // [m]
     double unknown_cost{1.0};      // extra cost per metre through unknown space, 0 = free
+    double vertical_cost{1.0};     // extra cost per metre of height change, 0 = free
     Eigen::AlignedBox3d bounds{Eigen::Vector3d(-50.0, -50.0, 0.5), Eigen::Vector3d(50.0, 50.0, 5.0)};
     int max_expansions{200000};
   };

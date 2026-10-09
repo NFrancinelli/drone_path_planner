@@ -44,6 +44,7 @@ public:
     AStarPlanner::Params params;
     params.inflation_radius = declare_parameter("inflation_radius", params.inflation_radius);
     params.unknown_cost = declare_parameter("unknown_cost", params.unknown_cost);
+    params.vertical_cost = declare_parameter("vertical_cost", params.vertical_cost);
     params.max_expansions =
       static_cast<int>(declare_parameter("max_expansions", params.max_expansions));
     const auto lo = declare_parameter("bounds_min", std::vector<double>{-20.0, -20.0, 0.5});
@@ -140,8 +141,7 @@ private:
     publish_path(*path_pub_, result.path, {});
 
     const auto t1 = std::chrono::steady_clock::now();
-    const auto waypoints = shortcut(
-      map, result.path, planner_->params().inflation_radius, planner_->params().unknown_cost);
+    const auto waypoints = shortcut(map, result.path, planner_->params());
     const auto t2 = std::chrono::steady_clock::now();
     const auto smoothed = smooth(map, waypoints, smoothing_);
     const auto t3 = std::chrono::steady_clock::now();

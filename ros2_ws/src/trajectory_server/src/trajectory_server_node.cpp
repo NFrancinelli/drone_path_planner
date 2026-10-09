@@ -5,18 +5,28 @@
 // trajectories the planner sends on `trajectory`, holding position between them.
 // A trajectory is only accepted while hovering, and must start where the drone holds;
 // the drone first turns in place to face along it.
+//
+// Everything here is in the ROS world frame (odom, where the map lives). PX4's local frame
+// can be shifted from it: EKF2 puts its origin where its estimate started, e.g. its height
+// origin at the drone resting on the ground (~0.2 m below odom with mocap). The offset is
+// measured from TF before takeoff, once steady while the drone is still, and kept up to
+// date across PX4's estimator resets, so setpoints and the map agree.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
 #include <drone_interfaces/msg/waypoint_trajectory.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tf2/exceptions.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
@@ -45,12 +55,14 @@ public:
   : Node("trajectory_server")
   {
     rate_hz_ = declare_parameter("rate_hz", 50.0);
+    // World-frame z, like the planner's goal_altitude, so the first plan stays level.
     takeoff_altitude_ = declare_parameter("takeoff_altitude", 2.5);
     max_vel_ = declare_parameter("max_vel", 1.0);
     max_acc_ = declare_parameter("max_acc", 1.0);
     max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
     max_yaw_acc_ = declare_parameter("max_yaw_acc", 1.0);
     world_frame_ = declare_parameter("world_frame", std::string("odom"));
+    body_frame_ = declare_parameter("body_frame", std::string("base_link"));
     prestream_time_ = declare_parameter("prestream_time", 1.0);
     hover_time_ = declare_parameter("hover_time", 2.0);
     // false: take off, hold position and fly the planner's trajectories.
@@ -74,7 +86,12 @@ public:
     status_sub_ = create_subscription<VehicleStatus>(
       status_topic, px4_qos, [this](VehicleStatus::ConstSharedPtr msg) {status_ = msg;});
     position_sub_ = create_subscription<VehicleLocalPosition>(
-      position_topic, px4_qos, [this](VehicleLocalPosition::ConstSharedPtr msg) {position_ = msg;});
+      position_topic, px4_qos, [this](VehicleLocalPosition::ConstSharedPtr msg) {
+        position_ = msg;
+        track_resets(*msg);
+      });
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     trajectory_sub_ = create_subscription<drone_interfaces::msg::WaypointTrajectory>(
       "trajectory", 1,
       [this](drone_interfaces::msg::WaypointTrajectory::ConstSharedPtr msg) {on_trajectory(*msg);});
@@ -121,8 +138,8 @@ private:
 
     switch (state_) {
       case State::WaitForPx4:
-        if (px4_ready()) {
-          hold(current_position_enu(), current_yaw_enu());
+        if (px4_ready() && measure_px4_offset()) {
+          hold(current_position(), current_yaw_enu());
           transition(State::Prestream);
         }
         break;
@@ -136,10 +153,10 @@ private:
 
       case State::Engaging:
         if (offboard() && armed()) {
-          const Eigen::Vector3d start = current_position_enu();
-          const Eigen::Vector3d top = start + Eigen::Vector3d(0, 0, takeoff_altitude_);
+          const Eigen::Vector3d start = current_position();
+          const Eigen::Vector3d top(start.x(), start.y(), takeoff_altitude_);
           follow(std::make_shared<QuinticLine>(start, top, hold_point_.yaw,
-            QuinticLine::min_duration(takeoff_altitude_, max_vel_, max_acc_)), now());
+            QuinticLine::min_duration((top - start).norm(), max_vel_, max_acc_)), now());
           transition(State::Takeoff);
         } else if (t - last_command_time_ > 1.0) {
           // Re-send until PX4 accepts; commands are fire-and-forget over DDS.
@@ -225,9 +242,66 @@ private:
     return status_ && status_->arming_state == VehicleStatus::ARMING_STATE_ARMED;
   }
 
-  Eigen::Vector3d current_position_enu() const
+  // Drone position in the world frame.
+  Eigen::Vector3d current_position() const
   {
-    return ned_to_enu({position_->x, position_->y, position_->z});
+    return ned_to_enu({position_->x, position_->y, position_->z}) + px4_offset_;
+  }
+
+  // PX4 local frame -> world frame offset, from the TF pose and PX4's estimate of the same
+  // pose. Only valid while the drone is still (on the ground, before arming), when the
+  // latest of each describe the same instant. EKF2 reports a valid position before it
+  // has fused the first vision heights, so wait until the offset has been steady for a
+  // while. Returns true once it has.
+  bool measure_px4_offset()
+  {
+    constexpr double kSteadyTime = 2.0;       // [s]
+    constexpr double kSteadyTolerance = 0.01;  // [m]
+    geometry_msgs::msg::TransformStamped tf;
+    try {
+      tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
+    } catch (const tf2::TransformException & e) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "Waiting for TF: %s", e.what());
+      return false;
+    }
+    const Eigen::Vector3d world(
+      tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
+    const Eigen::Vector3d offset = world - ned_to_enu({position_->x, position_->y, position_->z});
+    if (!steady_since_ || (offset - steady_offset_).norm() > kSteadyTolerance) {
+      steady_offset_ = offset;
+      steady_since_ = now();
+    }
+    if ((now() - *steady_since_).seconds() < kSteadyTime) {
+      return false;
+    }
+    px4_offset_ = offset;
+    xy_resets_ = position_->xy_reset_counter;
+    z_resets_ = position_->z_reset_counter;
+    have_offset_ = true;
+    RCLCPP_INFO(get_logger(), "PX4 local frame -> %s offset: (%.3f, %.3f, %.3f) m",
+      world_frame_.c_str(), px4_offset_.x(), px4_offset_.y(), px4_offset_.z());
+    return true;
+  }
+
+  // An estimator reset jumps PX4's position by delta_xy / delta_z while the drone stays
+  // put, so the offset moves the other way. Assumes at most one reset between messages.
+  void track_resets(const VehicleLocalPosition & msg)
+  {
+    if (!have_offset_) {
+      return;
+    }
+    if (msg.xy_reset_counter != xy_resets_) {
+      xy_resets_ = msg.xy_reset_counter;
+      px4_offset_.x() -= msg.delta_xy[1];  // NED (north, east) -> ENU (east, north)
+      px4_offset_.y() -= msg.delta_xy[0];
+      RCLCPP_WARN(get_logger(), "PX4 xy reset by (%.3f, %.3f) m NED, offset adjusted",
+        msg.delta_xy[0], msg.delta_xy[1]);
+    }
+    if (msg.z_reset_counter != z_resets_) {
+      z_resets_ = msg.z_reset_counter;
+      px4_offset_.z() += msg.delta_z;  // NED down -> ENU up
+      RCLCPP_WARN(get_logger(), "PX4 z reset by %.3f m NED, offset adjusted", msg.delta_z);
+    }
   }
 
   double current_yaw_enu() const {return ned_yaw_to_enu(position_->heading);}
@@ -348,7 +422,7 @@ private:
     mode.acceleration = true;
     mode_pub_->publish(mode);
 
-    const Eigen::Vector3f pos = enu_to_ned(sp.position).cast<float>();
+    const Eigen::Vector3f pos = enu_to_ned(sp.position - px4_offset_).cast<float>();
     const Eigen::Vector3f vel = enu_to_ned(sp.velocity).cast<float>();
     const Eigen::Vector3f acc = enu_to_ned(sp.acceleration).cast<float>();
     TrajectorySetpoint msg{};
@@ -394,12 +468,19 @@ private:
   double rate_hz_, takeoff_altitude_, max_vel_, max_acc_, prestream_time_, hover_time_;
   double max_yaw_rate_, max_yaw_acc_, max_start_error_;
   bool fly_figure_eight_;
-  std::string world_frame_;
+  std::string world_frame_, body_frame_;
   FigureEight::Params fig8_;
 
   // PX4 inputs
   VehicleStatus::ConstSharedPtr status_;
   VehicleLocalPosition::ConstSharedPtr position_;
+  Eigen::Vector3d px4_offset_{Eigen::Vector3d::Zero()};  // world = PX4 local (ENU) + offset
+  bool have_offset_{false};
+  std::optional<rclcpp::Time> steady_since_;  // offset within tolerance of steady_offset_
+  Eigen::Vector3d steady_offset_{Eigen::Vector3d::Zero()};
+  uint8_t xy_resets_{0}, z_resets_{0};
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // Mission state
   State state_{State::WaitForPx4};

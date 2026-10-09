@@ -26,7 +26,7 @@ struct SegmentCheck
 // Samples a -> b every quarter voxel. Cost uses the A* weighting per sampled voxel.
 SegmentCheck check_segment(
   const InflatedMap & inflated, const Key & exempt, const Eigen::Vector3d & a,
-  const Eigen::Vector3d & b, double unknown_cost)
+  const Eigen::Vector3d & b, const AStarPlanner::Params & params)
 {
   const OccupancyMap & map = inflated.map();
   const double length = (b - a).norm();
@@ -37,9 +37,10 @@ SegmentCheck check_segment(
     if (k != exempt && inflated.blocked(k)) {
       check.clear = false;
     }
-    const double weight = map.at(k) == Occupancy::Unknown ? 1.0 + unknown_cost : 1.0;
+    const double weight = map.at(k) == Occupancy::Unknown ? 1.0 + params.unknown_cost : 1.0;
     check.cost += weight * length / n;
   }
+  check.cost += params.vertical_cost * std::abs(b.z() - a.z());
   return check;
 }
 
@@ -96,19 +97,19 @@ double segment_duration(
 
 std::vector<Eigen::Vector3d> shortcut(
   const OccupancyMap & map, const std::vector<Eigen::Vector3d> & path,
-  double inflation_radius, double unknown_cost)
+  const AStarPlanner::Params & params)
 {
   if (path.size() <= 2) {
     return path;
   }
-  const InflatedMap inflated(map, inflation_radius);
+  const InflatedMap inflated(map, params.inflation_radius);
   const Key exempt = map.key(path.front());
 
   // Cost of the original path up to each waypoint, measured like the shortcuts.
   std::vector<double> cost_to{0.0};
   for (size_t i = 1; i < path.size(); ++i) {
     cost_to.push_back(
-      cost_to.back() + check_segment(inflated, exempt, path[i - 1], path[i], unknown_cost).cost);
+      cost_to.back() + check_segment(inflated, exempt, path[i - 1], path[i], params).cost);
   }
 
   std::vector<Eigen::Vector3d> out{path.front()};
@@ -116,7 +117,7 @@ std::vector<Eigen::Vector3d> shortcut(
   while (i + 1 < path.size()) {
     size_t next = i + 1;
     for (size_t j = path.size() - 1; j > i + 1; --j) {
-      const auto seg = check_segment(inflated, exempt, path[i], path[j], unknown_cost);
+      const auto seg = check_segment(inflated, exempt, path[i], path[j], params);
       if (seg.clear && seg.cost <= cost_to[j] - cost_to[i] + 1e-9) {
         next = j;
         break;

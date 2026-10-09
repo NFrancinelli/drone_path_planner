@@ -65,6 +65,7 @@ parameters:
 |---|---|---|
 | `inflation_radius` | 0.5 m | Clearance A* and the shortcut keep from occupied voxels |
 | `unknown_cost` | 1.0 | Extra cost per metre in unknown space (0 = treat as free) |
+| `vertical_cost` | 1.0 | Extra cost per metre of climb or descent, so paths keep their altitude unless climbing pays off |
 | `collision_radius` | 0.4 m | Clearance the smoothed trajectory must keep; ≤ `inflation_radius` |
 | `corner_distance` | 0.75 m | How far before and after a corner the rounding starts |
 | `max_vel`, `max_acc` | 1.0 m/s, 1.0 m/s² | Trajectory limits |
@@ -102,6 +103,12 @@ ground truth during the figure-eight, its heading error grows with turn rate (p9
 
 Everything in ROS uses ENU / FLU. Conversions to and from PX4's NED / FRD live in exactly one
 place, `trajectory_server/frames.hpp`, and are unit-tested.
+
+Frames: the map, planner and trajectory server all work in `odom`. PX4's local frame is
+shifted from it (EKF2 puts its height origin at the drone resting on the ground, ~0.2 m
+below `odom` in mocap mode), so the trajectory server measures that offset from TF before
+takeoff and applies it to everything it sends to and reads from PX4, following PX4's
+estimator resets.
 
 Time: px4_msgs timestamps are in the XRCE agent's system clock, while ROS runs on Gazebo's sim
 time. `px4_state_bridge/px4_time.hpp` converts between them exactly through PX4's timesync

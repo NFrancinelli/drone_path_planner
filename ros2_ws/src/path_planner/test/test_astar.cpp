@@ -137,6 +137,48 @@ TEST(AStar, UnknownCostTradesDistanceForKnownSpace)
   EXPECT_LT(detour.cost, 8.0);
 }
 
+TEST(AStar, VerticalCostKeepsAltitude)
+{
+  // Free space with a 0.5 m unknown block across the 2 m layer. Crossing it costs 0.5 extra;
+  // hopping a layer over it costs 0.21 extra in length, plus 0.5 of climb when charged.
+  TestMap map(Occupancy::Free);
+  map.set_box({2.1, -3.0, 2.0}, {2.4, 3.0, 2.0}, Occupancy::Unknown);
+  const Eigen::Vector3d start(0.125, 0.125, 2.125), goal(5.125, 0.125, 2.125);
+  AStarPlanner::Params params;
+
+  params.vertical_cost = 0.0;
+  const auto hop = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(hop.status, Status::Success);
+  bool left_layer = false;
+  for (const auto & p : hop.path) {
+    left_layer |= std::abs(p.z() - start.z()) > 1e-9;
+  }
+  EXPECT_TRUE(left_layer);
+
+  params.vertical_cost = 1.0;
+  const auto level = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(level.status, Status::Success);
+  for (const auto & p : level.path) {
+    EXPECT_DOUBLE_EQ(p.z(), start.z()) << p.transpose();
+  }
+  EXPECT_NEAR(level.cost, 5.0 + params.unknown_cost * 0.5, 1e-9);
+}
+
+TEST(AStar, VerticalCostChangesAltitudeOnce)
+{
+  // Free space, goal one metre up: the climb is charged once, never more.
+  const TestMap map(Occupancy::Free);
+  const Eigen::Vector3d start(0.125, 0.125, 1.125), goal(5.125, 0.125, 2.125);
+  AStarPlanner::Params params;
+  const auto result = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(result.status, Status::Success);
+  for (size_t i = 1; i < result.path.size(); ++i) {
+    EXPECT_GE(result.path[i].z(), result.path[i - 1].z() - 1e-9) << "waypoint " << i;
+  }
+  // 4 straight steps + 4 diagonal ones, plus 1 m of climb.
+  EXPECT_NEAR(result.cost, (16.0 + 4.0 * std::sqrt(2.0)) * kRes + params.vertical_cost, 1e-9);
+}
+
 TEST(AStar, RejectsBadStartAndGoal)
 {
   TestMap map(Occupancy::Free);
