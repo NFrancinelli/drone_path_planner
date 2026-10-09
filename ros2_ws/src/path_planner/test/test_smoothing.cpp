@@ -207,6 +207,81 @@ TEST(Smooth, YawFacesEachLegByItsCornerAndHoldsThroughClimbs)
   ASSERT_EQ(traj.turns().size(), 1u);
 }
 
+TEST(Smooth, ContinuesFromAMovingStart)
+{
+  // Takes over in flight: moving along the first leg, accelerating, and turning.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 0, 2}, {4, 0, 2}, {4, 4, 2}};
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0.8, 0.3, 0};
+  start.acceleration = {0.2, -0.1, 0};
+  start.yaw = 0.4;
+  start.yaw_rate = 0.3;
+  const auto result = smooth(distances(map), path, params, start);
+  ASSERT_TRUE(result.trajectory);
+  const auto & traj = *result.trajectory;
+
+  const auto p = traj.sample(0.0);
+  EXPECT_LT((p.position - path.front()).norm(), 1e-12);
+  EXPECT_LT((p.velocity - start.velocity).norm(), 1e-12);
+  EXPECT_LT((p.acceleration - start.acceleration).norm(), 1e-12);
+  EXPECT_NEAR(p.yaw, 0.4, 1e-12);
+  EXPECT_NEAR(p.yaw_rate, 0.3, 1e-12);
+  // Turns to face the first leg (east) first.
+  ASSERT_FALSE(traj.turns().empty());
+  const auto & first = traj.turns().front();
+  EXPECT_EQ(first.start, 0.0);
+  EXPECT_NEAR(traj.sample(first.duration).yaw, 0.0, 1e-9);
+  expect_within_limits(traj, params);
+  EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
+}
+
+TEST(Smooth, TurnsRoundAStartMovingAwayFromTheFirstLeg)
+{
+  // Replanning can reverse the direction of travel: the drone has to stop and come back.
+  const TestMap map(Occupancy::Free);
+  const Path path{{2, 2, 2}, {0, 2, 2}};
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0.9, 0, 0};
+  start.yaw = 0.0;
+  const auto result = smooth(distances(map), path, params, start);
+  ASSERT_TRUE(result.trajectory);
+  const auto & traj = *result.trajectory;
+  EXPECT_LT((traj.sample(0.0).velocity - start.velocity).norm(), 1e-12);
+  EXPECT_NEAR(traj.sample(traj.duration()).yaw, M_PI, 1e-9);
+  expect_within_limits(traj, params);
+  // Overshoots the start by about the braking distance, v^2 / 2a, then comes back.
+  double furthest = 0.0;
+  for (double t = 0.0; t <= traj.duration(); t += 0.01) {
+    furthest = std::max(furthest, traj.sample(t).position.x());
+  }
+  EXPECT_GT(furthest, 2.0 + 0.9 * 0.9 / (2 * params.max_acc) - 0.05);
+  EXPECT_LT(furthest, 2.0 + 1.5);
+  EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
+}
+
+TEST(Smooth, BrakesBeforeReversingOntoALongLeg)
+{
+  // From the sim: still accelerating north when the new goal sends it 7 m south. No single
+  // segment can turn that round within the limits, so it brakes to a stop first.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 1.367, 2.5}, {0, -6, 2.5}};
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0, 0.793, 0};
+  start.acceleration = {0, 0.186, 0};
+  start.yaw = M_PI_2;
+  const auto result = smooth(distances(map), path, params, start);
+  ASSERT_TRUE(result.trajectory) << result.failure;
+  const auto & traj = *result.trajectory;
+  EXPECT_EQ(traj.knots().size(), 3u);  // start, stop, goal
+  EXPECT_LT(traj.knots()[1].velocity.norm(), 1e-12);
+  expect_within_limits(traj, params);
+  EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
+}
+
 TEST(Smooth, RejectsDegeneratePath)
 {
   const TestMap map(Occupancy::Free);

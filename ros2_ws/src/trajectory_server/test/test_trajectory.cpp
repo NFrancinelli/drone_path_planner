@@ -1,4 +1,5 @@
 #include <cmath>
+#include <stdexcept>
 
 #include <gtest/gtest.h>
 
@@ -274,6 +275,37 @@ TEST(WaypointTrajectory, ContinuousAcrossKnots)
     EXPECT_LT((before.velocity - after.velocity).norm(), 1e-5);
     EXPECT_LT((before.acceleration - after.acceleration).norm(), 1e-5);
   }
+}
+
+TEST(WaypointTrajectory, ContinuesFromAMovingStart)
+{
+  // Takes over from a trajectory in flight: moving, accelerating and turning at t = 0.
+  std::vector<WaypointTrajectory::Knot> knots(3);
+  knots[0].position = {1, 1, 2};
+  knots[0].velocity = {0.8, 0.2, 0};
+  knots[0].acceleration = {0.3, -0.4, 0.1};
+  knots[1].position = {4, 2, 2};
+  knots[1].velocity = {0.5, 0.5, 0};
+  knots[2].position = {5, 5, 2};
+  const double rate = -0.5;
+  const WaypointTrajectory traj(knots, {4.0, 4.0}, 1.0, {{0.0, 2.5, 1.5}, {5.0, 2.0, 0.0}}, rate);
+
+  const auto p = traj.sample(0.0);
+  EXPECT_LT((p.position - knots[0].position).norm(), 1e-12);
+  EXPECT_LT((p.velocity - knots[0].velocity).norm(), 1e-12);
+  EXPECT_LT((p.acceleration - knots[0].acceleration).norm(), 1e-12);
+  EXPECT_NEAR(p.yaw, 1.0, 1e-12);
+  EXPECT_NEAR(p.yaw_rate, rate, 1e-12);
+  // The first turn still ends at its heading, at rest.
+  EXPECT_NEAR(traj.sample(2.5).yaw, 1.5, 1e-12);
+  EXPECT_NEAR(traj.sample(2.5).yaw_rate, 0.0, 1e-12);
+  expect_consistent_derivatives(traj);
+  expect_at_rest(traj, traj.duration());
+
+  // A start rate needs a turn to bring it to rest.
+  EXPECT_THROW(WaypointTrajectory(knots, {4.0, 4.0}, 1.0, {}, rate), std::invalid_argument);
+  EXPECT_THROW(
+    WaypointTrajectory(knots, {4.0, 4.0}, 1.0, {{0.5, 2.0, 1.5}}, rate), std::invalid_argument);
 }
 
 TEST(WaypointTrajectory, StaysOnSegmentsWhenStoppingAtKnots)

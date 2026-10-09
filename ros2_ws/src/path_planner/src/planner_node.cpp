@@ -2,6 +2,10 @@
 // then a smooth trajectory. Sends the trajectory to the trajectory server to fly, and
 // publishes the raw path and the trajectory for RViz. Plans once per goal.
 //
+// While the drone is flying a trajectory (`active_trajectory`, from the server), a new plan
+// continues it: it starts replan_lead seconds ahead on that trajectory, in exactly its state
+// there, and the server switches over at that moment. replan_lead must cover planning time.
+//
 // Goals come from RViz's "2D Goal Pose" tool, which sends z = 0, so the goal altitude is a
 // parameter.
 
@@ -40,6 +44,7 @@ public:
     world_frame_ = declare_parameter("world_frame", std::string("odom"));
     body_frame_ = declare_parameter("body_frame", std::string("base_link"));
     goal_altitude_ = declare_parameter("goal_altitude", 2.5);
+    replan_lead_ = declare_parameter("replan_lead", 1.0);
 
     AStarPlanner::Params params;
     params.inflation_radius = declare_parameter("inflation_radius", params.inflation_radius);
@@ -79,6 +84,13 @@ public:
     map_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
       "octomap_binary", 1,
       [this](octomap_msgs::msg::Octomap::ConstSharedPtr msg) {map_msg_ = msg;});
+    // Latched by the server: the planner trajectory it's flying, stamped with its start.
+    active_sub_ = create_subscription<drone_interfaces::msg::WaypointTrajectory>(
+      "active_trajectory", rclcpp::QoS(1).transient_local(),
+      [this](drone_interfaces::msg::WaypointTrajectory::ConstSharedPtr msg) {
+        active_ = trajectory_server::from_msg(*msg);
+        active_start_ = rclcpp::Time(msg->header.stamp, get_clock()->get_clock_type());
+      });
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "goal_pose", 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {on_goal(*msg);});
@@ -109,13 +121,30 @@ private:
       return;
     }
 
+    // Continue the trajectory being flown if it's still going at the takeover time, else
+    // start at rest from where the drone is.
     Eigen::Vector3d start;
-    try {
-      const auto tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
-      start = {tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z};
-    } catch (const tf2::TransformException & e) {
-      RCLCPP_WARN(get_logger(), "No drone pose: %s", e.what());
-      return;
+    StartState start_state;
+    rclcpp::Time start_time = now();
+    const rclcpp::Time takeover = now() + rclcpp::Duration::from_seconds(replan_lead_);
+    const bool continuing = active_ && (takeover - active_start_).seconds() < active_->duration();
+    if (continuing) {
+      const auto s = active_->sample((takeover - active_start_).seconds());
+      start = s.position;
+      start_state.velocity = s.velocity;
+      start_state.acceleration = s.acceleration;
+      start_state.yaw = s.yaw;
+      start_state.yaw_rate = s.yaw_rate;
+      start_time = takeover;
+    } else {
+      try {
+        const auto tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
+        const auto & t = tf.transform.translation;
+        start = {t.x, t.y, t.z};
+      } catch (const tf2::TransformException & e) {
+        RCLCPP_WARN(get_logger(), "No drone pose: %s", e.what());
+        return;
+      }
     }
 
     std::shared_ptr<octomap::AbstractOcTree> abstract(octomap_msgs::binaryMsgToMap(*map_msg_));
@@ -150,12 +179,20 @@ private:
     const auto t1 = std::chrono::steady_clock::now();
     const auto waypoints = shortcut(map, result.path, planner_->params());
     const auto t2 = std::chrono::steady_clock::now();
-    const auto smoothed = smooth(map, waypoints, smoothing_);
+    const auto smoothed = smooth(map, waypoints, smoothing_, start_state);
     const auto t3 = std::chrono::steady_clock::now();
     const double shortcut_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
     const double smooth_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     if (!smoothed.trajectory) {
-      RCLCPP_WARN(get_logger(), "Smoothing failed (%zu waypoints)", waypoints.size());
+      RCLCPP_WARN(get_logger(), "Smoothing failed (%zu waypoints): %s", waypoints.size(),
+        smoothed.failure);
+      for (const auto & w : waypoints) {
+        RCLCPP_WARN(get_logger(), "  waypoint (%.3f, %.3f, %.3f)", w.x(), w.y(), w.z());
+      }
+      const Eigen::Vector3d & v = start_state.velocity, & a = start_state.acceleration;
+      RCLCPP_WARN(get_logger(), "  start velocity (%.3f, %.3f, %.3f), acceleration (%.3f, %.3f, "
+        "%.3f), yaw %.3f, yaw rate %.3f", v.x(), v.y(), v.z(), a.x(), a.y(), a.z(),
+        start_state.yaw.value_or(NAN), start_state.yaw_rate);
       publish_path(*smoothed_pub_, {}, {});
       return;
     }
@@ -187,8 +224,16 @@ private:
     yaws.push_back(traj.sample(traj.duration()).yaw);
     publish_path(*smoothed_pub_, points, yaws);
 
+    if (continuing) {
+      const double margin = (takeover - now()).seconds();
+      if (margin < 0.05) {
+        RCLCPP_WARN(get_logger(), "Planning overran replan_lead (%.2f s left); not sent", margin);
+        return;
+      }
+      RCLCPP_INFO(get_logger(), "Continuing the current trajectory, takeover in %.2f s", margin);
+    }
     auto msg = trajectory_server::to_msg(traj);
-    msg.header.stamp = now();
+    msg.header.stamp = start_time;
     msg.header.frame_id = world_frame_;
     trajectory_pub_->publish(msg);
   }
@@ -222,15 +267,18 @@ private:
   }
 
   std::string world_frame_, body_frame_;
-  double goal_altitude_;
+  double goal_altitude_, replan_lead_;
   std::unique_ptr<AStarPlanner> planner_;
   SmoothingParams smoothing_;
   octomap_msgs::msg::Octomap::ConstSharedPtr map_msg_;
+  std::shared_ptr<const trajectory_server::WaypointTrajectory> active_;  // being flown
+  rclcpp::Time active_start_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
+  rclcpp::Subscription<drone_interfaces::msg::WaypointTrajectory>::SharedPtr active_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, smoothed_pub_;
   rclcpp::Publisher<drone_interfaces::msg::WaypointTrajectory>::SharedPtr trajectory_pub_;
 };

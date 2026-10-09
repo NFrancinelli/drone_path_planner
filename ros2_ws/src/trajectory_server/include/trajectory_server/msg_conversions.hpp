@@ -34,6 +34,7 @@ inline drone_interfaces::msg::WaypointTrajectory to_msg(const WaypointTrajectory
     }
   }
   msg.initial_yaw = trajectory.initial_yaw();
+  msg.initial_yaw_rate = trajectory.initial_yaw_rate();
   for (const auto & turn : trajectory.turns()) {
     drone_interfaces::msg::YawTurn t;
     t.start = turn.start;
@@ -61,7 +62,7 @@ inline std::shared_ptr<const WaypointTrajectory> from_msg(
     turns.push_back({t.start, t.duration, t.yaw});
   }
   return std::make_shared<const WaypointTrajectory>(
-    std::move(knots), msg.durations, msg.initial_yaw, std::move(turns));
+    std::move(knots), msg.durations, msg.initial_yaw, std::move(turns), msg.initial_yaw_rate);
 }
 
 }  // namespace trajectory_server

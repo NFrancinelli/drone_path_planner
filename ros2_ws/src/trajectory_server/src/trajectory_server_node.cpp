@@ -3,8 +3,11 @@
 // Mission: wait for PX4, pre-stream setpoints, switch to offboard, arm, take off, then
 // hover and fly the trajectories the planner sends on `trajectory`, holding position
 // between them; or (figure_eight.enabled) fly a figure-eight and land.
-// A trajectory is only accepted while hovering, and must start where the drone holds;
-// the drone first turns in place to face along it.
+// While hovering, a trajectory must start at rest where the drone holds; the drone first
+// turns in place to face along it. While flying one, a new trajectory is a continuation:
+// it must start in the future, in exactly the state the current one will be in then, and
+// takes over at that moment. The planner trajectory being flown is published on
+// `active_trajectory`, stamped with its actual start time, for the planner to continue.
 //
 // Everything here is in the ROS world frame (odom, where the map lives). PX4's local frame
 // can be shifted from it: EKF2 puts its origin where its estimate started, e.g. its height
@@ -20,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <drone_interfaces/msg/waypoint_trajectory.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -102,6 +106,8 @@ public:
     // Latched so RViz shows the active trajectory even if it subscribes later.
     path_pub_ = create_publisher<nav_msgs::msg::Path>(
       "planned_trajectory", rclcpp::QoS(1).transient_local());
+    active_pub_ = create_publisher<drone_interfaces::msg::WaypointTrajectory>(
+      "active_trajectory", rclcpp::QoS(1).transient_local());
 
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / rate_hz_), [this]() {tick();});
@@ -185,7 +191,7 @@ private:
 
       case State::Turn:
         if (trajectory_finished()) {
-          follow(pending_, std::max(now(), pending_start_));
+          follow(std::exchange(pending_, nullptr), std::max(now(), pending_start_));
           RCLCPP_INFO(get_logger(), "Flying trajectory: %.1f s", trajectory_->duration());
           transition(fly_figure_eight_ ? State::FigureEight : State::Follow);
         }
@@ -199,7 +205,11 @@ private:
         break;
 
       case State::Follow:
-        if (trajectory_finished()) {
+        if (pending_ && now() >= pending_start_) {
+          follow(std::exchange(pending_, nullptr), pending_start_);
+          RCLCPP_INFO(get_logger(), "Continuing on new trajectory: %.1f s",
+            trajectory_->duration());
+        } else if (!pending_ && trajectory_finished()) {
           transition(State::Hover);
         }
         break;
@@ -315,9 +325,9 @@ private:
 
   void on_trajectory(const drone_interfaces::msg::WaypointTrajectory & msg)
   {
-    if (fly_figure_eight_ || state_ != State::Hover) {
-      RCLCPP_WARN(get_logger(), "Trajectory ignored: only accepted while hovering with "
-        "figure_eight.enabled = false (state %s)", name(state_));
+    if (fly_figure_eight_ || (state_ != State::Hover && state_ != State::Follow)) {
+      RCLCPP_WARN(get_logger(), "Trajectory ignored: only accepted while hovering or following "
+        "one, with figure_eight.enabled = false (state %s)", name(state_));
       return;
     }
     if (msg.header.frame_id != world_frame_) {
@@ -332,15 +342,54 @@ private:
       RCLCPP_WARN(get_logger(), "Invalid trajectory ignored: %s", e.what());
       return;
     }
+    const rclcpp::Time stamp(msg.header.stamp, get_clock()->get_clock_type());
     const TrajectoryPoint start = trajectory->sample(0.0);
+    if (state_ == State::Follow) {
+      continue_with(trajectory, stamp);
+      return;
+    }
+    if (!start.velocity.isZero() || !start.acceleration.isZero()) {
+      RCLCPP_WARN(get_logger(), "Trajectory starts moving but nothing is being flown; ignored");
+      return;
+    }
     const double error = (start.position - hold_point_.position).norm();
     if (error > max_start_error_) {
       RCLCPP_WARN(get_logger(), "Trajectory starts %.2f m from the hold point (max %.2f); ignored",
         error, max_start_error_);
       return;
     }
-    turn_then_follow(
-      trajectory, start.yaw, rclcpp::Time(msg.header.stamp, get_clock()->get_clock_type()));
+    turn_then_follow(trajectory, start.yaw, stamp);
+  }
+
+  // Take over from the current trajectory at `start`, where the new one must pick up its
+  // state exactly. One continuation waits at a time: a new one replaces it only if it takes
+  // over earlier, since the waiting one would otherwise have to fly in between.
+  void continue_with(TrajectoryPtr trajectory, const rclcpp::Time & start)
+  {
+    const double lead = (start - now()).seconds();
+    if (lead <= 0.0) {
+      RCLCPP_WARN(get_logger(), "Continuation arrived %.3f s after its start time; ignored", -lead);
+      return;
+    }
+    if (pending_ && start >= pending_start_) {
+      RCLCPP_WARN(get_logger(), "Continuation starts after the one already waiting; ignored");
+      return;
+    }
+    const TrajectoryPoint from = trajectory_->sample((start - trajectory_start_).seconds());
+    const TrajectoryPoint to = trajectory->sample(0.0);
+    const double dp = (to.position - from.position).norm();
+    const double dv = (to.velocity - from.velocity).norm();
+    const double da = (to.acceleration - from.acceleration).norm();
+    const double dyaw = std::abs(wrap_angle(to.yaw - from.yaw));
+    const double drate = std::abs(to.yaw_rate - from.yaw_rate);
+    if (dp > 0.01 || dv > 0.01 || da > 0.01 || dyaw > 0.01 || drate > 0.01) {
+      RCLCPP_WARN(get_logger(), "Continuation doesn't match the current trajectory at its start "
+        "(%.3f m, %.3f m/s, %.3f m/s^2, %.3f rad, %.3f rad/s); ignored", dp, dv, da, dyaw, drate);
+      return;
+    }
+    pending_ = std::move(trajectory);
+    pending_start_ = start;
+    RCLCPP_INFO(get_logger(), "Continuation accepted, takes over in %.2f s", lead);
   }
 
   // Face along the trajectory before moving, so the heading doesn't jump at the start.
@@ -361,6 +410,13 @@ private:
     trajectory_ = std::move(trajectory);
     trajectory_start_ = start;
     publish_path(*trajectory_);
+    // Only the planner's trajectories can be continued.
+    if (const auto w = std::dynamic_pointer_cast<const WaypointTrajectory>(trajectory_)) {
+      auto msg = to_msg(*w);
+      msg.header.stamp = start;
+      msg.header.frame_id = world_frame_;
+      active_pub_->publish(msg);
+    }
   }
 
   void publish_path(const Trajectory & trajectory)
@@ -495,7 +551,7 @@ private:
   double last_command_time_{-std::numeric_limits<double>::infinity()};
   TrajectoryPtr trajectory_;
   rclcpp::Time trajectory_start_{now()};
-  TrajectoryPtr pending_;  // flown after the turn in State::Turn
+  TrajectoryPtr pending_;  // flown after the turn (Turn), or a continuation (Follow)
   rclcpp::Time pending_start_{now()};
   TrajectoryPoint hold_point_;
 
@@ -506,6 +562,7 @@ private:
   rclcpp::Publisher<TrajectorySetpoint>::SharedPtr setpoint_pub_;
   rclcpp::Publisher<VehicleCommand>::SharedPtr command_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<drone_interfaces::msg::WaypointTrajectory>::SharedPtr active_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Clock system_clock_{RCL_SYSTEM_TIME};
 };

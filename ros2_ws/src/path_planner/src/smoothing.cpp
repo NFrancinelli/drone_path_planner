@@ -45,31 +45,32 @@ SegmentCheck check_segment(
 // Below this a corner isn't worth rounding and the drone just stops there.
 constexpr double kMinCornerSpeed = 0.05;  // [m/s]
 
-// Shortest duration for a segment between two knots (zero acceleration at both) that keeps
-// speed and acceleration within limits and never moves backwards along the segment.
-// Candidates go from 3x the rest-to-rest duration down to a small fraction of it: moving
-// knots can need longer (speeding up from rest to a fast corner) or much shorter. The
-// rest-to-rest duration itself always fits when both knots are at rest. Returns 0 when
-// none fits, i.e. the knot speeds are too high for this segment.
+// Shortest duration for a segment between two knots that keeps speed and acceleration
+// within limits and, unless allow_reverse, never moves backwards along the segment.
+// Candidates go from 3x the rest-to-rest duration (plus time to turn a moving start round)
+// down to a small fraction of it: moving knots can need longer (speeding up from rest to a
+// fast corner) or much shorter. The rest-to-rest duration itself always fits when both
+// knots are at rest. Returns 0 when none fits, i.e. the knot speeds are too high for this
+// segment.
 double segment_duration(
   const WaypointTrajectory::Knot & a, const WaypointTrajectory::Knot & b,
-  const SmoothingParams & params)
+  const SmoothingParams & params, bool allow_reverse = false)
 {
   const Eigen::Vector3d delta = b.position - a.position;
   const Eigen::Vector3d dir = delta.normalized();
-  const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
   // The true peak can fall between samples, so keep a margin; otherwise the full check in
   // smooth() sees it and slows the corner down for nothing.
   constexpr double kMargin = 0.99;
   const auto fits = [&](double T) {
-      const QuinticHermite seg(a.position, a.velocity, zero, b.position, b.velocity, zero, T);
+      const QuinticHermite seg(
+        a.position, a.velocity, a.acceleration, b.position, b.velocity, b.acceleration, T);
       constexpr int kSamples = 64;
       for (int i = 0; i <= kSamples; ++i) {
         const double u = T * i / kSamples;
         const Eigen::Vector3d v = seg.velocity(u);
         if (v.norm() > params.max_vel * kMargin * (1.0 + 1e-9) ||
           seg.acceleration(u).norm() > params.max_acc * kMargin * (1.0 + 1e-9) ||
-          v.dot(dir) < -1e-9)
+          (!allow_reverse && v.dot(dir) < -1e-9))
         {
           return false;
         }
@@ -79,9 +80,10 @@ double segment_duration(
 
   const double rest = QuinticLine::min_duration(
     delta.norm(), params.max_vel * kMargin, params.max_acc * kMargin);
+  const double longest = 3.0 * rest + 4.0 * a.velocity.norm() / params.max_acc;
   double best = 0.0;
-  for (int i = 0; i <= 120; ++i) {
-    const double T = 3.0 * rest * std::pow(0.95, i);
+  for (int i = 0; i <= 140; ++i) {
+    const double T = longest * std::pow(0.95, i);
     if (fits(T)) {
       best = T;
     } else if (best > 0.0) {
@@ -89,6 +91,66 @@ double segment_duration(
     }
   }
   return best;
+}
+
+// Where a moving start comes to rest when braking straight ahead: the end of the shortest
+// segment from it to rest at p0 + v0 * T / 2 (as if decelerating evenly) that stays within
+// the limits and never moves backwards.
+WaypointTrajectory::Knot braking_stop(
+  const WaypointTrajectory::Knot & from, const SmoothingParams & params)
+{
+  const Eigen::Vector3d dir = from.velocity.normalized();
+  const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
+  for (double T = 0.1; ; T *= 1.05) {
+    const Eigen::Vector3d end = from.position + from.velocity * T / 2.0;
+    const QuinticHermite seg(from.position, from.velocity, from.acceleration, end, zero, zero, T);
+    bool fits = true;
+    constexpr int kSamples = 64;
+    for (int i = 0; i <= kSamples && fits; ++i) {
+      const double u = T * i / kSamples;
+      const Eigen::Vector3d v = seg.velocity(u);
+      fits = v.norm() <= params.max_vel * (1.0 + 1e-9) &&
+        seg.acceleration(u).norm() <= params.max_acc * (1.0 + 1e-9) && v.dot(dir) >= -1e-9;
+    }
+    if (fits) {
+      WaypointTrajectory::Knot stop;
+      stop.position = end;
+      return stop;
+    }
+  }
+}
+
+// Shortest duration for a yaw turn from (from, rate) to `to` at rest, within the yaw rate
+// and acceleration limits. Same profile as WaypointTrajectory's first turn.
+double first_turn_duration(double from, double rate, double to, const SmoothingParams & params)
+{
+  const double delta = trajectory_server::wrap_angle(to - from);
+  const auto fits = [&](double T) {
+      constexpr int kSamples = 64;
+      for (int i = 0; i <= kSamples; ++i) {
+        const double tau = static_cast<double>(i) / kSamples;
+        const double tau2 = tau * tau, tau3 = tau2 * tau;
+        // Rest-to-rest quintic plus the start-rate basis (see WaypointTrajectory::sample).
+        const double ds = 30.0 * tau2 - 60.0 * tau3 + 30.0 * tau3 * tau;
+        const double dds = 60.0 * tau - 180.0 * tau2 + 120.0 * tau3;
+        const double dh = 1.0 - 18.0 * tau2 + 32.0 * tau3 - 15.0 * tau3 * tau;
+        const double ddh = -36.0 * tau + 96.0 * tau2 - 60.0 * tau3;
+        const double r = delta * ds / T + rate * dh;
+        const double acc = delta * dds / (T * T) + rate * ddh / T;
+        if (std::abs(r) > params.max_yaw_rate * (1.0 + 1e-9) ||
+          std::abs(acc) > params.max_yaw_acc * (1.0 + 1e-9))
+        {
+          return false;
+        }
+      }
+      return true;
+    };
+  double T = std::max(
+    YawTurn::min_duration(from, to, params.max_yaw_rate, params.max_yaw_acc), 0.1);
+  while (!fits(T)) {
+    T *= 1.1;
+  }
+  return T;
 }
 
 }  // namespace
@@ -128,7 +190,7 @@ std::vector<Eigen::Vector3d> shortcut(
 
 SmoothingResult smooth(
   const DistanceMap & map, const std::vector<Eigen::Vector3d> & waypoints,
-  const SmoothingParams & params)
+  const SmoothingParams & params, const StartState & start)
 {
   if (map.max_distance() < params.collision_radius - 1e-9) {
     throw std::invalid_argument("Distance map too short-ranged for collision_radius");
@@ -142,6 +204,7 @@ SmoothingResult smooth(
     }
   }
   if (pts.size() < 2) {
+    result.failure = "fewer than two distinct waypoints";
     return result;
   }
   const size_t n = pts.size();
@@ -191,6 +254,24 @@ SmoothingResult smooth(
     c.rounded = c.speed > kMinCornerSpeed;
   }
 
+  // A moving start leads straight into the first segment, unless it's heading away from the
+  // first leg or too fast to make it: then it brakes to a stop straight ahead first. One
+  // quintic can't turn a fast, accelerating start round onto a long leg within the limits.
+  std::optional<WaypointTrajectory::Knot> stop;
+  if (!start.velocity.isZero()) {
+    WaypointTrajectory::Knot from, to;
+    from.position = pts[0];
+    from.velocity = start.velocity;
+    from.acceleration = start.acceleration;
+    const Corner & first = corners[1];
+    to.position = n > 2 && first.rounded ? pts[1] - first.reach * first.in : pts[1];
+    if (start.velocity.dot(pts[1] - pts[0]) < 0.0 ||
+      segment_duration(from, to, params, true) == 0.0)
+    {
+      stop = braking_stop(from, params);
+    }
+  }
+
   const Key exempt = map.key(pts.front());
   const double dt = 0.25 * map.resolution() / params.max_vel;
   std::vector<bool> stopped(n, false);
@@ -206,7 +287,11 @@ SmoothingResult smooth(
         knots.push_back(knot);
         owner.push_back(k);
       };
-    add(pts.front(), Eigen::Vector3d::Zero(), -1);
+    add(pts.front(), start.velocity, -1);
+    knots.front().acceleration = start.acceleration;
+    if (stop) {
+      add(stop->position, Eigen::Vector3d::Zero(), -1);
+    }
     for (size_t k = 1; k + 1 < n; ++k) {
       const Corner & c = corners[k];
       const int id = static_cast<int>(k);
@@ -246,7 +331,7 @@ SmoothingResult smooth(
     std::vector<double> durations(m - 1);
     bool infeasible = false;
     for (size_t j = 0; j + 1 < m; ++j) {
-      durations[j] = segment_duration(knots[j], knots[j + 1], params);
+      durations[j] = segment_duration(knots[j], knots[j + 1], params, j == 0);
       if (durations[j] == 0.0) {
         mark_slow(owner[j]);
         mark_slow(owner[j + 1]);
@@ -267,6 +352,15 @@ SmoothingResult smooth(
     }
     std::vector<WaypointTrajectory::Turn> turns;
     double yaw = heading.front(), free_from = 0.0;
+    const double yaw0 = start.yaw.value_or(heading.front());
+    const double yaw_rate0 = start.yaw ? start.yaw_rate : 0.0;
+    const double first_turn = trajectory_server::wrap_angle(heading.front() - yaw0);
+    if (std::abs(first_turn) > 1e-6 || yaw_rate0 != 0.0) {
+      // Face the first leg first, carrying on from the current yaw rate.
+      const double T = first_turn_duration(yaw0, yaw_rate0, heading.front(), params);
+      turns.push_back({0.0, T, heading.front()});
+      free_from = T;
+    }
     for (size_t k = 1; k + 1 < n; ++k) {
       if (std::abs(trajectory_server::wrap_angle(heading[k] - yaw)) < 1e-6) {
         continue;
@@ -278,7 +372,8 @@ SmoothingResult smooth(
       yaw = heading[k];
     }
 
-    auto traj = std::make_shared<const WaypointTrajectory>(knots, durations, heading.front(), turns);
+    auto traj = std::make_shared<const WaypointTrajectory>(
+      knots, durations, yaw0, turns, turns.empty() ? 0.0 : yaw_rate0);
 
     std::vector<bool> too_fast(m - 1, false), collides(m - 1, false);
     size_t seg = 0;
@@ -313,7 +408,10 @@ SmoothingResult smooth(
           }
         }
         if (!stopped_any) {
-          return result;  // a straight leg is too close; the map changed under us
+          // A straight leg is too close (the map changed under us), or a moving start
+          // swings too close while turning round.
+          result.failure = j == 0 ? "first segment collides" : "straight leg collides";
+          return result;
         }
         changed = true;
       } else if (too_fast[j]) {
@@ -328,6 +426,7 @@ SmoothingResult smooth(
       return result;
     }
   }
+  result.failure = "no timing within the limits";
   return result;
 }
 

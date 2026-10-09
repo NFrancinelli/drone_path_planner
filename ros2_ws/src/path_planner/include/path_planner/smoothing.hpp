@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <Eigen/Core>
@@ -31,13 +32,25 @@ struct SmoothingParams
   double corner_distance{0.75};  // [m] how far before and after a corner the turn starts
 };
 
+// State a trajectory starts in: at rest by default, or the state of the trajectory being
+// flown at the moment the new one takes over from it.
+struct StartState
+{
+  Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d acceleration{Eigen::Vector3d::Zero()};
+  std::optional<double> yaw;  // [rad]; unset: already facing the first leg
+  double yaw_rate{0.0};       // [rad/s]
+};
+
 struct SmoothingResult
 {
   std::shared_ptr<const trajectory_server::WaypointTrajectory> trajectory;  // null on failure
   int stopped_knots{0};  // corners where the drone stops instead of rounding them
+  const char * failure{""};  // why there's no trajectory
 };
 
-// Smooth trajectory through shortcut waypoints, at rest at both ends. It passes exactly
+// Smooth trajectory through shortcut waypoints from `start` (at rest by default) to rest at
+// the last waypoint. It passes exactly
 // through every waypoint and follows the straight legs except within corner_distance of a
 // corner, where it rounds the turn at a speed set by the turn angle. Each segment gets the
 // shortest duration that respects the limits.
@@ -46,9 +59,12 @@ struct SmoothingResult
 // legs the shortcut already checked. Corners over the vel/acc limits are slowed down.
 // Yaw starts facing the first leg and turns to face each next leg by the time the drone
 // reaches its corner (or as soon as possible after, when corners are close); climbs keep
-// the heading. The caller turns the drone to the first leg's heading beforehand.
+// the heading. From rest, the caller turns the drone to the first leg's heading beforehand;
+// with start.yaw set, the trajectory turns to it first, as fast as the limits allow from
+// start.yaw_rate. A moving start leads straight into the first segment, which may bulge
+// off the first leg while the velocity swings round (it's collision-checked like the rest).
 SmoothingResult smooth(
   const DistanceMap & map, const std::vector<Eigen::Vector3d> & waypoints,
-  const SmoothingParams & params);
+  const SmoothingParams & params, const StartState & start = {});
 
 }  // namespace path_planner

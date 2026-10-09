@@ -57,9 +57,11 @@ plans from the drone's current position on the latest OctoMap and shows:
 
 The planner sends the trajectory to the trajectory server (`drone_interfaces/WaypointTrajectory`
 on `/trajectory`, rebuilt exactly on the other side), which turns the drone to face the first
-leg, flies it and hovers at the goal until the next one. Goals clicked while the drone is
-flying are ignored for now; if no path is found, the drone keeps hovering. Main `path_planner`
-parameters:
+leg, flies it and hovers at the goal until the next one. A goal clicked while the drone is
+flying continues the current trajectory: the new one starts `replan_lead` (1 s) ahead on it,
+in exactly its position, velocity, acceleration and heading there, and the server switches
+over at that moment, braking first if the new path heads back. If no path is found, the
+drone carries on (or keeps hovering). Main `path_planner` parameters:
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -69,6 +71,7 @@ parameters:
 | `clearance_radius`, `clearance_cost` | 1.0 m, 1.0 | Within this distance of an obstacle, extra cost per metre rising to `clearance_cost` at `inflation_radius`: paths run down the middle of gaps |
 | `collision_radius` | 0.4 m | Clearance the smoothed trajectory must keep; ≤ `inflation_radius` |
 | `corner_distance` | 0.75 m | How far before and after a corner the rounding starts |
+| `replan_lead` | 1.0 s | How far ahead on the current trajectory a new plan takes over; must cover planning time |
 | `max_vel`, `max_acc` | 1.0 m/s, 1.0 m/s² | Trajectory limits |
 | `bounds_min`, `bounds_max` | (−20, −20, 0.5), (20, 20, 4) m | Search volume |
 

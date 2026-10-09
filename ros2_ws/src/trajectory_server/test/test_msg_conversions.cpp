@@ -9,16 +9,19 @@ using trajectory_server::WaypointTrajectory;
 namespace
 {
 
-// Moving knots with accelerations, and a turn that runs past the last knot.
+// Moving start (continuing a trajectory in flight), moving knots with accelerations, and a
+// turn that runs past the last knot.
 WaypointTrajectory example_trajectory()
 {
   std::vector<WaypointTrajectory::Knot> knots(3);
   knots[0].position = {1, 2, 2.5};
+  knots[0].velocity = {0.6, 0.1, 0};
+  knots[0].acceleration = {-0.2, 0.3, 0};
   knots[1].position = {4, 2, 2.5};
   knots[1].velocity = {0.4, 0.3, 0};
   knots[1].acceleration = {0.1, -0.2, 0.05};
   knots[2].position = {4, 6, 3};
-  return WaypointTrajectory(knots, {4.0, 5.5}, 0.3, {{0.5, 2.0, 1.2}, {8.0, 3.0, -2.0}});
+  return WaypointTrajectory(knots, {4.0, 5.5}, 0.3, {{0.0, 2.0, 1.2}, {8.0, 3.0, -2.0}}, 0.4);
 }
 
 }  // namespace
