@@ -1,18 +1,32 @@
 // Streams trajectory setpoints to PX4 in offboard mode.
 //
-// For now this runs a hardcoded mission: wait for PX4, pre-stream setpoints, switch to
-// offboard, arm, take off, fly a figure-eight, land.
-// TODO: take trajectories from the planner over a topic instead of the scripted figure-eight.
+// Mission: wait for PX4, pre-stream setpoints, switch to offboard, arm, take off, then
+// either fly a figure-eight and land, or (figure_eight.enabled = false) hover and fly the
+// trajectories the planner sends on `trajectory`, holding position between them.
+// A trajectory is only accepted while hovering, and must start where the drone holds;
+// the drone first turns in place to face along it.
+//
+// Everything here is in the ROS world frame (odom, where the map lives). PX4's local frame
+// can be shifted from it: EKF2 puts its origin where its estimate started, e.g. its height
+// origin at the drone resting on the ground (~0.2 m below odom with mocap). The offset is
+// measured from TF before takeoff, once steady while the drone is still, and kept up to
+// date across PX4's estimator resets, so setpoints and the map agree.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 
+#include <drone_interfaces/msg/waypoint_trajectory.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tf2/exceptions.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
@@ -21,6 +35,7 @@
 #include <px4_msgs/msg/vehicle_status.hpp>
 
 #include "trajectory_server/frames.hpp"
+#include "trajectory_server/msg_conversions.hpp"
 #include "trajectory_server/trajectory.hpp"
 
 using namespace std::chrono_literals;
@@ -40,14 +55,20 @@ public:
   : Node("trajectory_server")
   {
     rate_hz_ = declare_parameter("rate_hz", 50.0);
+    // World-frame z, like the planner's goal_altitude, so the first plan stays level.
     takeoff_altitude_ = declare_parameter("takeoff_altitude", 2.5);
     max_vel_ = declare_parameter("max_vel", 1.0);
     max_acc_ = declare_parameter("max_acc", 1.0);
     max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
     max_yaw_acc_ = declare_parameter("max_yaw_acc", 1.0);
     world_frame_ = declare_parameter("world_frame", std::string("odom"));
+    body_frame_ = declare_parameter("body_frame", std::string("base_link"));
     prestream_time_ = declare_parameter("prestream_time", 1.0);
     hover_time_ = declare_parameter("hover_time", 2.0);
+    // false: take off, hold position and fly the planner's trajectories.
+    fly_figure_eight_ = declare_parameter("figure_eight.enabled", true);
+    // Planner trajectories must start this close to the hold point [m].
+    max_start_error_ = declare_parameter("max_start_error", 0.3);
     fig8_.half_length = declare_parameter("figure_eight.half_length", fig8_.half_length);
     fig8_.half_width = declare_parameter("figure_eight.half_width", fig8_.half_width);
     fig8_.loop_period = declare_parameter("figure_eight.loop_period", fig8_.loop_period);
@@ -65,7 +86,15 @@ public:
     status_sub_ = create_subscription<VehicleStatus>(
       status_topic, px4_qos, [this](VehicleStatus::ConstSharedPtr msg) {status_ = msg;});
     position_sub_ = create_subscription<VehicleLocalPosition>(
-      position_topic, px4_qos, [this](VehicleLocalPosition::ConstSharedPtr msg) {position_ = msg;});
+      position_topic, px4_qos, [this](VehicleLocalPosition::ConstSharedPtr msg) {
+        position_ = msg;
+        track_resets(*msg);
+      });
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    trajectory_sub_ = create_subscription<drone_interfaces::msg::WaypointTrajectory>(
+      "trajectory", 1,
+      [this](drone_interfaces::msg::WaypointTrajectory::ConstSharedPtr msg) {on_trajectory(*msg);});
 
     mode_pub_ = create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
     setpoint_pub_ = create_publisher<TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
@@ -81,7 +110,10 @@ public:
   }
 
 private:
-  enum class State { WaitForPx4, Prestream, Engaging, Takeoff, Hover, Turn, FigureEight, Landing, Done };
+  enum class State
+  {
+    WaitForPx4, Prestream, Engaging, Takeoff, Hover, Turn, FigureEight, Follow, Landing, Done
+  };
 
   static const char * name(State s)
   {
@@ -93,6 +125,7 @@ private:
       case State::Hover: return "HOVER";
       case State::Turn: return "TURN";
       case State::FigureEight: return "FIGURE_EIGHT";
+      case State::Follow: return "FOLLOW";
       case State::Landing: return "LANDING";
       case State::Done: return "DONE";
     }
@@ -105,8 +138,8 @@ private:
 
     switch (state_) {
       case State::WaitForPx4:
-        if (px4_ready()) {
-          hold(current_position_enu(), current_yaw_enu());
+        if (px4_ready() && measure_px4_offset()) {
+          hold(current_position(), current_yaw_enu());
           transition(State::Prestream);
         }
         break;
@@ -120,10 +153,10 @@ private:
 
       case State::Engaging:
         if (offboard() && armed()) {
-          const Eigen::Vector3d start = current_position_enu();
-          const Eigen::Vector3d top = start + Eigen::Vector3d(0, 0, takeoff_altitude_);
+          const Eigen::Vector3d start = current_position();
+          const Eigen::Vector3d top(start.x(), start.y(), takeoff_altitude_);
           follow(std::make_shared<QuinticLine>(start, top, hold_point_.yaw,
-            QuinticLine::min_duration(takeoff_altitude_, max_vel_, max_acc_)));
+            QuinticLine::min_duration((top - start).norm(), max_vel_, max_acc_)), now());
           transition(State::Takeoff);
         } else if (t - last_command_time_ > 1.0) {
           // Re-send until PX4 accepts; commands are fire-and-forget over DDS.
@@ -143,22 +176,18 @@ private:
         break;
 
       case State::Hover:
-        if (t > hover_time_) {
-          // Face along the path before moving, so the heading doesn't jump at the start.
-          figure_eight_ = std::make_shared<FigureEight>(
-            hold_point_.position, hold_point_.yaw, fig8_);
-          const double from = hold_point_.yaw, to = figure_eight_->start_yaw();
-          follow(std::make_shared<YawTurn>(hold_point_.position, from, to,
-            YawTurn::min_duration(from, to, max_yaw_rate_, max_yaw_acc_)));
-          transition(State::Turn);
+        if (fly_figure_eight_ && t > hover_time_) {
+          const auto fig8 =
+            std::make_shared<FigureEight>(hold_point_.position, hold_point_.yaw, fig8_);
+          turn_then_follow(fig8, fig8->start_yaw(), now());
         }
         break;
 
       case State::Turn:
         if (trajectory_finished()) {
-          follow(figure_eight_);
-          RCLCPP_INFO(get_logger(), "Figure-eight: %.1f s", trajectory_->duration());
-          transition(State::FigureEight);
+          follow(pending_, std::max(now(), pending_start_));
+          RCLCPP_INFO(get_logger(), "Flying trajectory: %.1f s", trajectory_->duration());
+          transition(fly_figure_eight_ ? State::FigureEight : State::Follow);
         }
         break;
 
@@ -166,6 +195,12 @@ private:
         if (trajectory_finished()) {
           send_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
           transition(State::Landing);
+        }
+        break;
+
+      case State::Follow:
+        if (trajectory_finished()) {
+          transition(State::Hover);
         }
         break;
 
@@ -207,19 +242,119 @@ private:
     return status_ && status_->arming_state == VehicleStatus::ARMING_STATE_ARMED;
   }
 
-  Eigen::Vector3d current_position_enu() const
+  // Drone position in the world frame.
+  Eigen::Vector3d current_position() const
   {
-    return ned_to_enu({position_->x, position_->y, position_->z});
+    return ned_to_enu({position_->x, position_->y, position_->z}) + px4_offset_;
+  }
+
+  // PX4 local frame -> world frame offset, from the TF pose and PX4's estimate of the same
+  // pose. Only valid while the drone is still (on the ground, before arming), when the
+  // latest of each describe the same instant. EKF2 reports a valid position before it
+  // has fused the first vision heights, so wait until the offset has been steady for a
+  // while. Returns true once it has.
+  bool measure_px4_offset()
+  {
+    constexpr double kSteadyTime = 2.0;       // [s]
+    constexpr double kSteadyTolerance = 0.01;  // [m]
+    geometry_msgs::msg::TransformStamped tf;
+    try {
+      tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
+    } catch (const tf2::TransformException & e) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "Waiting for TF: %s", e.what());
+      return false;
+    }
+    const Eigen::Vector3d world(
+      tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
+    const Eigen::Vector3d offset = world - ned_to_enu({position_->x, position_->y, position_->z});
+    if (!steady_since_ || (offset - steady_offset_).norm() > kSteadyTolerance) {
+      steady_offset_ = offset;
+      steady_since_ = now();
+    }
+    if ((now() - *steady_since_).seconds() < kSteadyTime) {
+      return false;
+    }
+    px4_offset_ = offset;
+    xy_resets_ = position_->xy_reset_counter;
+    z_resets_ = position_->z_reset_counter;
+    have_offset_ = true;
+    RCLCPP_INFO(get_logger(), "PX4 local frame -> %s offset: (%.3f, %.3f, %.3f) m",
+      world_frame_.c_str(), px4_offset_.x(), px4_offset_.y(), px4_offset_.z());
+    return true;
+  }
+
+  // An estimator reset jumps PX4's position by delta_xy / delta_z while the drone stays
+  // put, so the offset moves the other way. Assumes at most one reset between messages.
+  void track_resets(const VehicleLocalPosition & msg)
+  {
+    if (!have_offset_) {
+      return;
+    }
+    if (msg.xy_reset_counter != xy_resets_) {
+      xy_resets_ = msg.xy_reset_counter;
+      px4_offset_.x() -= msg.delta_xy[1];  // NED (north, east) -> ENU (east, north)
+      px4_offset_.y() -= msg.delta_xy[0];
+      RCLCPP_WARN(get_logger(), "PX4 xy reset by (%.3f, %.3f) m NED, offset adjusted",
+        msg.delta_xy[0], msg.delta_xy[1]);
+    }
+    if (msg.z_reset_counter != z_resets_) {
+      z_resets_ = msg.z_reset_counter;
+      px4_offset_.z() += msg.delta_z;  // NED down -> ENU up
+      RCLCPP_WARN(get_logger(), "PX4 z reset by %.3f m NED, offset adjusted", msg.delta_z);
+    }
   }
 
   double current_yaw_enu() const {return ned_yaw_to_enu(position_->heading);}
 
   // --- trajectory handling -------------------------------------------------------------
 
-  void follow(TrajectoryPtr trajectory)
+  void on_trajectory(const drone_interfaces::msg::WaypointTrajectory & msg)
+  {
+    if (fly_figure_eight_ || state_ != State::Hover) {
+      RCLCPP_WARN(get_logger(), "Trajectory ignored: only accepted while hovering with "
+        "figure_eight.enabled = false (state %s)", name(state_));
+      return;
+    }
+    if (msg.header.frame_id != world_frame_) {
+      RCLCPP_WARN(get_logger(), "Trajectory in frame '%s', expected '%s'; ignored",
+        msg.header.frame_id.c_str(), world_frame_.c_str());
+      return;
+    }
+    std::shared_ptr<const WaypointTrajectory> trajectory;
+    try {
+      trajectory = from_msg(msg);
+    } catch (const std::invalid_argument & e) {
+      RCLCPP_WARN(get_logger(), "Invalid trajectory ignored: %s", e.what());
+      return;
+    }
+    const TrajectoryPoint start = trajectory->sample(0.0);
+    const double error = (start.position - hold_point_.position).norm();
+    if (error > max_start_error_) {
+      RCLCPP_WARN(get_logger(), "Trajectory starts %.2f m from the hold point (max %.2f); ignored",
+        error, max_start_error_);
+      return;
+    }
+    turn_then_follow(
+      trajectory, start.yaw, rclcpp::Time(msg.header.stamp, get_clock()->get_clock_type()));
+  }
+
+  // Face along the trajectory before moving, so the heading doesn't jump at the start.
+  // The trajectory starts once the turn is done, but not before `start`.
+  void turn_then_follow(TrajectoryPtr trajectory, double start_yaw, const rclcpp::Time & start)
+  {
+    pending_ = std::move(trajectory);
+    pending_start_ = start;
+    const double from = hold_point_.yaw;
+    const double duration = YawTurn::min_duration(from, start_yaw, max_yaw_rate_, max_yaw_acc_);
+    follow(std::make_shared<YawTurn>(hold_point_.position, from, start_yaw, duration), now());
+    transition(State::Turn);
+  }
+
+  // Sampling holds the start point until `start`, so a start in the future just waits.
+  void follow(TrajectoryPtr trajectory, const rclcpp::Time & start)
   {
     trajectory_ = std::move(trajectory);
-    trajectory_start_ = now();
+    trajectory_start_ = start;
     publish_path(*trajectory_);
   }
 
@@ -287,7 +422,7 @@ private:
     mode.acceleration = true;
     mode_pub_->publish(mode);
 
-    const Eigen::Vector3f pos = enu_to_ned(sp.position).cast<float>();
+    const Eigen::Vector3f pos = enu_to_ned(sp.position - px4_offset_).cast<float>();
     const Eigen::Vector3f vel = enu_to_ned(sp.velocity).cast<float>();
     const Eigen::Vector3f acc = enu_to_ned(sp.acceleration).cast<float>();
     TrajectorySetpoint msg{};
@@ -331,25 +466,35 @@ private:
 
   // Parameters
   double rate_hz_, takeoff_altitude_, max_vel_, max_acc_, prestream_time_, hover_time_;
-  double max_yaw_rate_, max_yaw_acc_;
-  std::string world_frame_;
+  double max_yaw_rate_, max_yaw_acc_, max_start_error_;
+  bool fly_figure_eight_;
+  std::string world_frame_, body_frame_;
   FigureEight::Params fig8_;
 
   // PX4 inputs
   VehicleStatus::ConstSharedPtr status_;
   VehicleLocalPosition::ConstSharedPtr position_;
+  Eigen::Vector3d px4_offset_{Eigen::Vector3d::Zero()};  // world = PX4 local (ENU) + offset
+  bool have_offset_{false};
+  std::optional<rclcpp::Time> steady_since_;  // offset within tolerance of steady_offset_
+  Eigen::Vector3d steady_offset_{Eigen::Vector3d::Zero()};
+  uint8_t xy_resets_{0}, z_resets_{0};
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // Mission state
   State state_{State::WaitForPx4};
   rclcpp::Time state_entered_{now()};
   double last_command_time_{-std::numeric_limits<double>::infinity()};
   TrajectoryPtr trajectory_;
-  std::shared_ptr<const FigureEight> figure_eight_;
   rclcpp::Time trajectory_start_{now()};
+  TrajectoryPtr pending_;  // flown after the turn in State::Turn
+  rclcpp::Time pending_start_{now()};
   TrajectoryPoint hold_point_;
 
   rclcpp::Subscription<VehicleStatus>::SharedPtr status_sub_;
   rclcpp::Subscription<VehicleLocalPosition>::SharedPtr position_sub_;
+  rclcpp::Subscription<drone_interfaces::msg::WaypointTrajectory>::SharedPtr trajectory_sub_;
   rclcpp::Publisher<OffboardControlMode>::SharedPtr mode_pub_;
   rclcpp::Publisher<TrajectorySetpoint>::SharedPtr setpoint_pub_;
   rclcpp::Publisher<VehicleCommand>::SharedPtr command_pub_;

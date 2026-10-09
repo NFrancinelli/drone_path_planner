@@ -196,9 +196,19 @@ def generate_launch_description():
             # the octree for the planner. Checked against the voxel extent, so it has to be
             # above the whole floor layer (0.0-0.2 m).
             "occupancy_min_z": 0.25,
+            # Free-space markers for debugging. Only read at startup.
+            "publish_free_space": LaunchConfiguration("show_free_space"),
         }],
         remappings=[("cloud_in", "/camera/points")],
         output="log",
+    )
+
+    planner = Node(
+        package="path_planner",
+        executable="planner_node",
+        name="path_planner",
+        parameters=[sim_time],
+        output="screen",
     )
 
     rviz = Node(
@@ -215,7 +225,7 @@ def generate_launch_description():
         package="trajectory_server",
         executable="trajectory_server_node",
         name="trajectory_server",
-        parameters=[sim_time],
+        parameters=[sim_time, {"figure_eight.enabled": LaunchConfiguration("figure_eight")}],
         output="screen",
         condition=IfCondition(LaunchConfiguration("mission")),
     )
@@ -224,8 +234,12 @@ def generate_launch_description():
         DeclareLaunchArgument("world", default_value="boxes", description="world in drone_sim/worlds"),
         DeclareLaunchArgument("gui", default_value="false", description="open the Gazebo GUI"),
         DeclareLaunchArgument("rviz", default_value="true"),
-        DeclareLaunchArgument("mission", default_value="true", description="run the figure-eight mission"),
+        DeclareLaunchArgument("mission", default_value="true", description="run the trajectory server"),
+        DeclareLaunchArgument("figure_eight", default_value="true",
+                              description="false: take off, hover and fly planner trajectories instead"),
         DeclareLaunchArgument("map_resolution", default_value="0.2", description="OctoMap voxel size [m]"),
+        DeclareLaunchArgument("show_free_space", default_value="false",
+                              description="publish OctoMap free voxels on /free_cells_vis_array"),
         DeclareLaunchArgument("localization", default_value="mocap", choices=["mocap", "gps"],
                               description="mocap: ground truth fed to PX4; gps: PX4's own estimate"),
         *gz_env,
@@ -238,6 +252,7 @@ def generate_launch_description():
         state_bridge,
         mocap,
         octomap,
+        planner,
         rviz,
         # PX4 needs the drone to exist before it can attach to it.
         RegisterEventHandler(OnProcessExit(target_action=spawn, on_exit=[

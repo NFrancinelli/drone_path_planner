@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -102,6 +103,73 @@ private:
   Params p_;
   double omega_;
   double cruise_time_;
+  double duration_;
+};
+
+// Quintic polynomial from (p0, v0, a0) to (p1, v1, a1) over [0, T], in 3D.
+class QuinticHermite
+{
+public:
+  QuinticHermite(
+    const Eigen::Vector3d & p0, const Eigen::Vector3d & v0, const Eigen::Vector3d & a0,
+    const Eigen::Vector3d & p1, const Eigen::Vector3d & v1, const Eigen::Vector3d & a1, double T);
+
+  double duration() const {return T_;}
+  // u in [0, T], not clamped.
+  Eigen::Vector3d position(double u) const;
+  Eigen::Vector3d velocity(double u) const;
+  Eigen::Vector3d acceleration(double u) const;
+
+private:
+  Eigen::Vector3d c_[6];  // c_[i] * u^i
+  double T_;
+};
+
+// Piecewise quintic through knots. Each segment is the quintic Hermite interpolant of
+// position, velocity and acceleration at its two knots, so the trajectory is C2 and passes
+// exactly through every knot. First and last knots must be at rest.
+// Yaw has its own timeline, independent of the knots: it starts at initial_yaw and changes
+// only during the given turns, each a rest-to-rest quintic taking the short way round.
+// If the last turn ends after the last knot, the drone holds position until it's done.
+class WaypointTrajectory : public Trajectory
+{
+public:
+  struct Knot
+  {
+    Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d velocity{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d acceleration{Eigen::Vector3d::Zero()};
+  };
+
+  struct Turn
+  {
+    double start;     // [s] from the start of the trajectory
+    double duration;  // [s]
+    double yaw;       // heading reached at start + duration
+  };
+
+  // durations[k] is the time from knot k to knot k + 1. Turns sorted and not overlapping.
+  WaypointTrajectory(
+    std::vector<Knot> knots, std::vector<double> durations, double initial_yaw,
+    std::vector<Turn> turns = {});
+
+  double duration() const override {return duration_;}
+  TrajectoryPoint sample(double t) const override;
+
+  const std::vector<Knot> & knots() const {return knots_;}
+  const std::vector<Turn> & turns() const {return turns_;}
+  // Time at which the trajectory passes knot k.
+  double knot_time(size_t k) const {return times_.at(k);}
+  // Time from knot k to knot k + 1.
+  double segment_duration(size_t k) const {return segments_.at(k).duration();}
+  double initial_yaw() const {return initial_yaw_;}
+
+private:
+  std::vector<Knot> knots_;
+  std::vector<double> times_;  // cumulative, times_[0] = 0
+  std::vector<QuinticHermite> segments_;
+  double initial_yaw_;
+  std::vector<Turn> turns_;
   double duration_;
 };
 

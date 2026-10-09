@@ -52,6 +52,38 @@ Visualization Manager:
         Reliability Policy: Reliable
       Value: true
     - Class: rviz_default_plugins/Path
+      Name: A* path
+      Enabled: true
+      Color: 230; 60; 230
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.05
+      Buffer Length: 1
+      Pose Style: None
+      Topic:
+        Value: /planned_path
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Name: Smoothed trajectory
+      Enabled: true
+      Color: 0; 190; 255
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.05
+      Buffer Length: 1
+      Pose Style: None
+      Topic:
+        Value: /smoothed_path
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Value: true
+    - Class: rviz_default_plugins/Path
       Name: Flown trail
       Enabled: true
       Color: 0; 200; 120
@@ -107,6 +139,13 @@ Visualization Manager:
     - Class: rviz_default_plugins/Interact
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
   Value: true
   Views:
     Current:
