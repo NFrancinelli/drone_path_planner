@@ -17,6 +17,7 @@
   <depend>octomap_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>trajectory_server</depend>
+  <depend>drone_interfaces</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

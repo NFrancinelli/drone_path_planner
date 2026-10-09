@@ -1,6 +1,6 @@
 // Plans from the drone's current position to a goal on the live OctoMap: A*, shortcut,
-// then a smooth trajectory. Publishes the raw path and the trajectory for RViz.
-// Plans once per goal; nothing is flown yet.
+// then a smooth trajectory. Sends the trajectory to the trajectory server to fly, and
+// publishes the raw path and the trajectory for RViz. Plans once per goal.
 //
 // Goals come from RViz's "2D Goal Pose" tool, which sends z = 0, so the goal altitude is a
 // parameter.
@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include <drone_interfaces/msg/waypoint_trajectory.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <octomap/OcTree.h>
@@ -25,6 +26,7 @@
 #include "path_planner/astar.hpp"
 #include "path_planner/octomap_map.hpp"
 #include "path_planner/smoothing.hpp"
+#include "trajectory_server/msg_conversions.hpp"
 
 namespace path_planner
 {
@@ -68,6 +70,8 @@ public:
       "planned_path", rclcpp::QoS(1).transient_local());
     smoothed_pub_ = create_publisher<nav_msgs::msg::Path>(
       "smoothed_path", rclcpp::QoS(1).transient_local());
+    // Not latched: a trajectory server that starts later must not fly a stale plan.
+    trajectory_pub_ = create_publisher<drone_interfaces::msg::WaypointTrajectory>("trajectory", 1);
     // Only the latest map is kept; it's deserialized when a plan is requested.
     map_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
       "octomap_binary", 1,
@@ -175,6 +179,11 @@ private:
     points.push_back(traj.sample(traj.duration()).position);
     yaws.push_back(traj.sample(traj.duration()).yaw);
     publish_path(*smoothed_pub_, points, yaws);
+
+    auto msg = trajectory_server::to_msg(traj);
+    msg.header.stamp = now();
+    msg.header.frame_id = world_frame_;
+    trajectory_pub_->publish(msg);
   }
 
   void clear_paths()
@@ -216,6 +225,7 @@ private:
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr map_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, smoothed_pub_;
+  rclcpp::Publisher<drone_interfaces::msg::WaypointTrajectory>::SharedPtr trajectory_pub_;
 };
 
 }  // namespace path_planner

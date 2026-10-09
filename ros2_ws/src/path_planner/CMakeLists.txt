@@ -20,6 +20,7 @@ find_package(octomap REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(trajectory_server REQUIRED)
+find_package(drone_interfaces REQUIRED)
 
 # ROS-independent core: search and smoothing on an abstract voxel map.
 add_library(planner_core src/astar.cpp src/inflated_map.cpp src/smoothing.cpp)
@@ -31,7 +32,8 @@ target_link_libraries(planner_core PUBLIC Eigen3::Eigen trajectory_server::traje
 add_executable(planner_node src/planner_node.cpp)
 target_include_directories(planner_node PRIVATE ${OCTOMAP_INCLUDE_DIRS})
 target_link_libraries(planner_node planner_core ${OCTOMAP_LIBRARIES})
-ament_target_dependencies(planner_node rclcpp geometry_msgs nav_msgs octomap_msgs tf2_ros)
+ament_target_dependencies(planner_node
+  rclcpp geometry_msgs nav_msgs octomap_msgs tf2_ros drone_interfaces)
 
 install(TARGETS planner_node DESTINATION lib/${PROJECT_NAME})
 

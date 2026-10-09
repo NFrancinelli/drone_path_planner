@@ -160,6 +160,9 @@ public:
   const std::vector<Turn> & turns() const {return turns_;}
   // Time at which the trajectory passes knot k.
   double knot_time(size_t k) const {return times_.at(k);}
+  // Time from knot k to knot k + 1.
+  double segment_duration(size_t k) const {return segments_.at(k).duration();}
+  double initial_yaw() const {return initial_yaw_;}
 
 private:
   std::vector<Knot> knots_;
