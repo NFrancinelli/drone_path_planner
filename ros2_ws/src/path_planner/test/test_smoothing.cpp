@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -6,6 +8,7 @@
 #include "path_planner/astar.hpp"
 #include "path_planner/inflated_map.hpp"
 #include "path_planner/smoothing.hpp"
+#include "trajectory_server/frames.hpp"
 #include "test_map.hpp"
 
 using path_planner::AStarPlanner;
@@ -43,8 +46,22 @@ double length(const Path & path)
   return l;
 }
 
-// L-shaped path at z = 2.125: east 3 m, then north 3 m.
-const Path kCorner{{0.125, 0.125, 2.125}, {3.125, 0.125, 2.125}, {3.125, 3.125, 2.125}};
+// L-shaped path at z = 2.125: east 3 m, then north 3 m. The first leg runs 1 cm inside its
+// voxel row, so any outward rounding enters the next row.
+const Path kCorner{{0.125, 0.01, 2.125}, {3.125, 0.01, 2.125}, {3.125, 3.125, 2.125}};
+
+// Index of the knot sitting on `p`.
+size_t knot_at(const trajectory_server::WaypointTrajectory & traj, const Eigen::Vector3d & p)
+{
+  const auto & knots = traj.knots();
+  for (size_t k = 0; k < knots.size(); ++k) {
+    if ((knots[k].position - p).norm() < 1e-9) {
+      return k;
+    }
+  }
+  ADD_FAILURE() << "no knot at " << p.transpose();
+  return 0;
+}
 
 void expect_within_limits(const trajectory_server::Trajectory & traj, const SmoothingParams & p)
 {
@@ -53,6 +70,34 @@ void expect_within_limits(const trajectory_server::Trajectory & traj, const Smoo
     EXPECT_LE(s.velocity.norm(), p.max_vel * 1.001) << "t = " << t;
     EXPECT_LE(s.acceleration.norm(), p.max_acc * 1.001) << "t = " << t;
     EXPECT_LE(std::abs(s.yaw_rate), p.max_yaw_rate * 1.001) << "t = " << t;
+  }
+}
+
+// Largest distance from the trajectory to the polyline through `path`.
+double max_deviation(const trajectory_server::Trajectory & traj, const Path & path)
+{
+  double worst = 0.0;
+  for (double t = 0.0; t <= traj.duration(); t += 0.01) {
+    const Eigen::Vector3d p = traj.sample(t).position;
+    double nearest = std::numeric_limits<double>::infinity();
+    for (size_t i = 1; i < path.size(); ++i) {
+      const Eigen::Vector3d a = path[i - 1], d = path[i] - a;
+      const double s = std::clamp((p - a).dot(d) / d.squaredNorm(), 0.0, 1.0);
+      nearest = std::min(nearest, (a + s * d - p).norm());
+    }
+    worst = std::max(worst, nearest);
+  }
+  return worst;
+}
+
+// Yaw rate matches the change in yaw, including across the end of the position knots.
+void expect_consistent_yaw(const trajectory_server::Trajectory & traj)
+{
+  const double h = 1e-5;
+  for (double t = h; t < traj.duration() - h; t += 0.01) {
+    const double rate =
+      trajectory_server::wrap_angle(traj.sample(t + h).yaw - traj.sample(t - h).yaw) / (2 * h);
+    EXPECT_NEAR(rate, traj.sample(t).yaw_rate, 1e-4) << "t = " << t;
   }
 }
 
@@ -118,8 +163,9 @@ TEST(Smooth, KeepsMovingThroughFreeCorner)
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   EXPECT_EQ(result.stopped_knots, 0);
-  EXPECT_GT(traj.sample(traj.knot_time(1)).velocity.norm(), 0.1);
-  EXPECT_LT((traj.sample(traj.knot_time(1)).position - kCorner[1]).norm(), 1e-9);
+  const double t_corner = traj.knot_time(knot_at(traj, kCorner[1]));
+  EXPECT_GT(traj.sample(t_corner).velocity.norm(), 0.1);
+  EXPECT_LT((traj.sample(t_corner).position - kCorner[1]).norm(), 1e-9);
   EXPECT_LT((traj.sample(traj.duration()).position - kCorner[2]).norm(), 1e-9);
   EXPECT_LT(traj.sample(traj.duration()).velocity.norm(), 1e-9);
   expect_within_limits(traj, params);
@@ -127,16 +173,17 @@ TEST(Smooth, KeepsMovingThroughFreeCorner)
 
 TEST(Smooth, StopsAtCornerWhenTheCurveWouldHitAnObstacle)
 {
-  // Column 0.5 m outside the first leg: clear of the straight path (> 0.4 m), but the
-  // rounded corner bulges ~0.4 m outward and would pass right next to it.
+  // Column two voxel rows outside the first leg, just before the corner: clear of the
+  // straight legs (0.5 m), but the rounding swings slightly outward into the row next to it.
   TestMap map(Occupancy::Free);
-  map.set_box({2.2, -0.3, 1.5}, {2.2, -0.3, 2.8}, Occupancy::Occupied);
+  map.set_box({2.9, -0.3, 1.5}, {2.9, -0.3, 2.8}, Occupancy::Occupied);
   const SmoothingParams params;
   const auto result = smooth(map, kCorner, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
-  EXPECT_GE(result.stopped_knots, 1);
-  EXPECT_LT(traj.sample(traj.knot_time(1)).velocity.norm(), 1e-9);
+  EXPECT_EQ(result.stopped_knots, 1);
+  EXPECT_EQ(traj.knots().size(), 3u);  // start, stopped corner, goal
+  EXPECT_LT(traj.sample(traj.knot_time(knot_at(traj, kCorner[1]))).velocity.norm(), 1e-9);
   const InflatedMap clearance(map, params.collision_radius);
   for (double t = 0.0; t <= traj.duration(); t += 0.02) {
     EXPECT_FALSE(clearance.blocked(traj.sample(t).position)) << "t = " << t;
@@ -144,17 +191,21 @@ TEST(Smooth, StopsAtCornerWhenTheCurveWouldHitAnObstacle)
   expect_within_limits(traj, params);
 }
 
-TEST(Smooth, YawFacesNextSegmentAndHoldsThroughClimbs)
+TEST(Smooth, YawFacesEachLegByItsCornerAndHoldsThroughClimbs)
 {
   const TestMap map(Occupancy::Free);
   const Path path{{0, 0, 1}, {2, 0, 1}, {2, 0, 3}, {2, 2, 3}};
   const auto result = smooth(map, path, SmoothingParams{});
   ASSERT_TRUE(result.trajectory);
-  const auto & knots = result.trajectory->knots();
-  EXPECT_NEAR(knots[0].yaw, 0.0, 1e-12);
-  EXPECT_NEAR(knots[1].yaw, 0.0, 1e-12);  // climb: keeps facing east
-  EXPECT_NEAR(knots[2].yaw, M_PI_2, 1e-12);
-  EXPECT_NEAR(knots[3].yaw, M_PI_2, 1e-12);
+  const auto & traj = *result.trajectory;
+  const auto yaw_at = [&](const Eigen::Vector3d & p) {
+      return traj.sample(traj.knot_time(knot_at(traj, p))).yaw;
+    };
+  EXPECT_NEAR(yaw_at(path[0]), 0.0, 1e-12);
+  EXPECT_NEAR(yaw_at(path[1]), 0.0, 1e-12);  // climb: keeps facing east
+  EXPECT_NEAR(yaw_at(path[2]), M_PI_2, 1e-12);  // turned by the time it reaches the corner
+  EXPECT_NEAR(traj.sample(traj.duration()).yaw, M_PI_2, 1e-12);
+  ASSERT_EQ(traj.turns().size(), 1u);
 }
 
 TEST(Smooth, RejectsDegeneratePath)
@@ -162,4 +213,44 @@ TEST(Smooth, RejectsDegeneratePath)
   const TestMap map(Occupancy::Free);
   EXPECT_FALSE(smooth(map, {{1, 1, 1}}, SmoothingParams{}).trajectory);
   EXPECT_FALSE(smooth(map, {{1, 1, 1}, {1, 1, 1}}, SmoothingParams{}).trajectory);
+}
+
+TEST(Smooth, CornersStayCloseToTheStraightPath)
+{
+  // Rounding only happens within corner_distance (0.75 m) of the corner, so the curve
+  // stays within ~0.1 m of the straight legs instead of drifting over the whole leg.
+  const TestMap map(Occupancy::Free);
+  const SmoothingParams params;
+  const Path shallow{{0, 0, 2}, {4, 0, 2}, {7, 2.5, 2}};  // ~40 deg turn
+  const auto sharp = smooth(map, kCorner, params);
+  const auto gentle = smooth(map, shallow, params);
+  ASSERT_TRUE(sharp.trajectory);
+  ASSERT_TRUE(gentle.trajectory);
+  EXPECT_LT(max_deviation(*sharp.trajectory, kCorner), 0.15);
+  EXPECT_LT(max_deviation(*gentle.trajectory, shallow), 0.08);
+  // A gentle turn is taken faster than a sharp one.
+  const auto corner_speed = [](const auto & traj, const Eigen::Vector3d & p) {
+      return traj.sample(traj.knot_time(knot_at(traj, p))).velocity.norm();
+    };
+  EXPECT_GT(corner_speed(*gentle.trajectory, shallow[1]), corner_speed(*sharp.trajectory, kCorner[1]));
+  expect_within_limits(*sharp.trajectory, params);
+  expect_within_limits(*gentle.trajectory, params);
+}
+
+TEST(Smooth, CloseCornersDoNotSlowTheFlightForYaw)
+{
+  // Two corners 0.57 m apart with a 46 deg heading change between them, as the planner
+  // produced in the sim. The turn can't finish on that short stretch; it may run late,
+  // but the corners keep their speed.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 0, 2.77}, {1.1, 0.9, 2.7}, {1.7, 1.5, 2.5}, {2.1, 1.9, 2.5}, {2.0, 6.5, 2.5}};
+  const SmoothingParams params;
+  const auto result = smooth(map, path, params);
+  ASSERT_TRUE(result.trajectory);
+  const auto & traj = *result.trajectory;
+  for (size_t k = 1; k + 1 < path.size(); ++k) {
+    EXPECT_GT(traj.sample(traj.knot_time(knot_at(traj, path[k]))).velocity.norm(), 0.2) << k;
+  }
+  expect_within_limits(traj, params);
+  expect_consistent_yaw(traj);
 }

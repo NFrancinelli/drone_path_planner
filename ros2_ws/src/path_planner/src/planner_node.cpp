@@ -55,6 +55,7 @@ public:
     smoothing_.max_yaw_rate = declare_parameter("max_yaw_rate", smoothing_.max_yaw_rate);
     smoothing_.max_yaw_acc = declare_parameter("max_yaw_acc", smoothing_.max_yaw_acc);
     smoothing_.collision_radius = declare_parameter("collision_radius", smoothing_.collision_radius);
+    smoothing_.corner_distance = declare_parameter("corner_distance", smoothing_.corner_distance);
     if (smoothing_.collision_radius > params.inflation_radius) {
       throw std::invalid_argument("collision_radius must not exceed inflation_radius");
     }
@@ -137,18 +138,33 @@ private:
     const auto t1 = std::chrono::steady_clock::now();
     const auto waypoints = shortcut(
       map, result.path, planner_->params().inflation_radius, planner_->params().unknown_cost);
+    const auto t2 = std::chrono::steady_clock::now();
     const auto smoothed = smooth(map, waypoints, smoothing_);
-    const double smooth_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    const auto t3 = std::chrono::steady_clock::now();
+    const double shortcut_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    const double smooth_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     if (!smoothed.trajectory) {
       RCLCPP_WARN(get_logger(), "Smoothing failed (%zu waypoints)", waypoints.size());
       publish_path(*smoothed_pub_, {}, {});
       return;
     }
     const auto & traj = *smoothed.trajectory;
+    for (const auto & w : waypoints) {
+      RCLCPP_DEBUG(get_logger(), "waypoint (%.3f, %.3f, %.3f)", w.x(), w.y(), w.z());
+    }
+    for (size_t k = 0; k < traj.knots().size(); ++k) {
+      const auto & knot = traj.knots()[k];
+      RCLCPP_DEBUG(get_logger(), "knot %zu at %.2f s: (%.2f, %.2f, %.2f), %.2f m/s",
+        k, traj.knot_time(k), knot.position.x(), knot.position.y(), knot.position.z(),
+        knot.velocity.norm());
+    }
+    for (const auto & turn : traj.turns()) {
+      RCLCPP_DEBUG(get_logger(), "turn to %.2f rad from %.2f s to %.2f s",
+        turn.yaw, turn.start, turn.start + turn.duration);
+    }
     RCLCPP_INFO(get_logger(),
-      "Trajectory: %zu waypoints, %d stopped at, %.1f s long, smoothed in %.1f ms",
-      waypoints.size(), smoothed.stopped_knots, traj.duration(), smooth_ms);
+      "Trajectory: %zu waypoints, %d stopped at, %.1f s long (shortcut %.1f ms, smoothing %.1f ms)",
+      waypoints.size(), smoothed.stopped_knots, traj.duration(), shortcut_ms, smooth_ms);
     std::vector<Eigen::Vector3d> points;
     std::vector<double> yaws;
     for (double t = 0.0; t < traj.duration(); t += 0.1) {

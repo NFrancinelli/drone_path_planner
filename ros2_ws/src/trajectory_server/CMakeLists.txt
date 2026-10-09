@@ -6,6 +6,11 @@ if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
+# trajectory_core is also linked into the planner, whose smoothing samples it heavily;
+# unoptimized it's ~100x slower. Default to Release.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)

@@ -158,8 +158,40 @@ TrajectoryPoint FigureEight::sample(double t) const
   return p;
 }
 
-WaypointTrajectory::WaypointTrajectory(std::vector<Knot> knots, std::vector<double> durations)
-: knots_(std::move(knots)), times_{0.0}
+QuinticHermite::QuinticHermite(
+  const Eigen::Vector3d & p0, const Eigen::Vector3d & v0, const Eigen::Vector3d & a0,
+  const Eigen::Vector3d & p1, const Eigen::Vector3d & v1, const Eigen::Vector3d & a1, double T)
+: T_(T)
+{
+  const Eigen::Vector3d dp = p1 - p0;
+  const double T2 = T * T, T3 = T2 * T;
+  c_[0] = p0;
+  c_[1] = v0;
+  c_[2] = a0 / 2.0;
+  c_[3] = (20.0 * dp - (8.0 * v1 + 12.0 * v0) * T - (3.0 * a0 - a1) * T2) / (2.0 * T3);
+  c_[4] = (-30.0 * dp + (14.0 * v1 + 16.0 * v0) * T + (3.0 * a0 - 2.0 * a1) * T2) / (2.0 * T3 * T);
+  c_[5] = (12.0 * dp - 6.0 * (v1 + v0) * T + (a1 - a0) * T2) / (2.0 * T3 * T2);
+}
+
+Eigen::Vector3d QuinticHermite::position(double u) const
+{
+  return c_[0] + u * (c_[1] + u * (c_[2] + u * (c_[3] + u * (c_[4] + u * c_[5]))));
+}
+
+Eigen::Vector3d QuinticHermite::velocity(double u) const
+{
+  return c_[1] + u * (2.0 * c_[2] + u * (3.0 * c_[3] + u * (4.0 * c_[4] + u * 5.0 * c_[5])));
+}
+
+Eigen::Vector3d QuinticHermite::acceleration(double u) const
+{
+  return 2.0 * c_[2] + u * (6.0 * c_[3] + u * (12.0 * c_[4] + u * 20.0 * c_[5]));
+}
+
+WaypointTrajectory::WaypointTrajectory(
+  std::vector<Knot> knots, std::vector<double> durations, double initial_yaw,
+  std::vector<Turn> turns)
+: knots_(std::move(knots)), times_{0.0}, initial_yaw_(initial_yaw), turns_(std::move(turns))
 {
   if (knots_.size() < 2 || durations.size() != knots_.size() - 1) {
     throw std::invalid_argument("WaypointTrajectory needs n >= 2 knots and n - 1 durations");
@@ -176,45 +208,52 @@ WaypointTrajectory::WaypointTrajectory(std::vector<Knot> knots, std::vector<doub
     }
     const Knot & a = knots_[i];
     const Knot & b = knots_[i + 1];
-    const Eigen::Vector3d dp = b.position - a.position;
-    const double T2 = T * T, T3 = T2 * T;
-    // Quintic Hermite: matches position, velocity and acceleration at both ends.
-    Segment s;
-    s.c[0] = a.position;
-    s.c[1] = a.velocity;
-    s.c[2] = a.acceleration / 2.0;
-    s.c[3] = (20.0 * dp - (8.0 * b.velocity + 12.0 * a.velocity) * T -
-      (3.0 * a.acceleration - b.acceleration) * T2) / (2.0 * T3);
-    s.c[4] = (-30.0 * dp + (14.0 * b.velocity + 16.0 * a.velocity) * T +
-      (3.0 * a.acceleration - 2.0 * b.acceleration) * T2) / (2.0 * T3 * T);
-    s.c[5] = (12.0 * dp - 6.0 * (b.velocity + a.velocity) * T +
-      (b.acceleration - a.acceleration) * T2) / (2.0 * T3 * T2);
-    s.yaw0 = a.yaw;
-    s.dyaw = wrap_angle(b.yaw - a.yaw);
-    segments_.push_back(s);
+    segments_.emplace_back(
+      a.position, a.velocity, a.acceleration, b.position, b.velocity, b.acceleration, T);
     times_.push_back(times_.back() + T);
   }
+  duration_ = times_.back();
+  double free_from = 0.0;
+  for (const Turn & turn : turns_) {
+    if (turn.duration <= 0.0 || turn.start < free_from - 1e-9) {
+      throw std::invalid_argument("WaypointTrajectory turns must be sorted, not overlap, last > 0");
+    }
+    free_from = turn.start + turn.duration;
+  }
+  duration_ = std::max(duration_, free_from);
 }
 
 TrajectoryPoint WaypointTrajectory::sample(double t) const
 {
   t = std::clamp(t, 0.0, duration());
-  // Last segment whose start time is <= t.
+  const double tp = std::min(t, times_.back());  // past the last knot: hold it
+  // Last segment whose start time is <= tp.
   const size_t k = std::min<size_t>(
-    std::upper_bound(times_.begin(), times_.end(), t) - times_.begin() - 1, segments_.size() - 1);
-  const Segment & s = segments_[k];
-  const double T = times_[k + 1] - times_[k];
-  const double u = t - times_[k];
+    std::upper_bound(times_.begin(), times_.end(), tp) - times_.begin() - 1, segments_.size() - 1);
+  const QuinticHermite & s = segments_[k];
+  const double u = tp - times_[k];
 
   TrajectoryPoint p;
-  p.position = s.c[0] + u * (s.c[1] + u * (s.c[2] + u * (s.c[3] + u * (s.c[4] + u * s.c[5]))));
-  p.velocity = s.c[1] + u * (2.0 * s.c[2] + u * (3.0 * s.c[3] + u * (4.0 * s.c[4] + u * 5.0 * s.c[5])));
-  p.acceleration = 2.0 * s.c[2] + u * (6.0 * s.c[3] + u * (12.0 * s.c[4] + u * 20.0 * s.c[5]));
+  p.position = s.position(u);
+  p.velocity = s.velocity(u);
+  p.acceleration = s.acceleration(u);
 
-  double ys, dys, ddys;
-  quintic(u / T, ys, dys, ddys);
-  p.yaw = wrap_angle(s.yaw0 + s.dyaw * ys);
-  p.yaw_rate = s.dyaw * dys / T;
+  // Heading before the first turn that hasn't finished yet, then interpolate if t is in it.
+  p.yaw = initial_yaw_;
+  for (const Turn & turn : turns_) {
+    if (t < turn.start) {
+      break;
+    }
+    const double delta = wrap_angle(turn.yaw - p.yaw);
+    if (t < turn.start + turn.duration) {
+      double ys, dys, ddys;
+      quintic((t - turn.start) / turn.duration, ys, dys, ddys);
+      p.yaw_rate = delta * dys / turn.duration;
+      p.yaw = wrap_angle(p.yaw + delta * ys);
+      break;
+    }
+    p.yaw = wrap_angle(turn.yaw);
+  }
   return p;
 }
 

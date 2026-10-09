@@ -217,21 +217,19 @@ TEST(FigureEight, RejectsRampLongerThanMission)
 namespace
 {
 
-// L-shaped path with a moving knot at the corner and a climb on the last leg.
+// L-shaped path with a moving knot at the corner and a climb on the last leg. Two yaw
+// turns: one finishing at the corner, one that runs past the last knot.
 WaypointTrajectory corner_trajectory()
 {
   std::vector<WaypointTrajectory::Knot> knots(4);
   knots[0].position = {0, 0, 2};
   knots[1].position = {3, 0, 2};
   knots[1].velocity = {0.5, 0.5, 0};
-  knots[1].yaw = M_PI_2;
   knots[2].position = {3, 3, 2.5};
   knots[2].velocity = {0, 0.6, 0.1};
   knots[2].acceleration = {0.1, 0, 0};
-  knots[2].yaw = M_PI_2;
   knots[3].position = {3, 5, 3};
-  knots[3].yaw = 3.0;
-  return WaypointTrajectory(knots, {4.0, 4.5, 3.0});
+  return WaypointTrajectory(knots, {4.0, 4.5, 3.0}, 0.0, {{1.0, 3.0, M_PI_2}, {10.0, 2.5, 3.0}});
 }
 
 }  // namespace
@@ -239,19 +237,31 @@ WaypointTrajectory corner_trajectory()
 TEST(WaypointTrajectory, PassesThroughKnotsWithTheirDerivatives)
 {
   const auto traj = corner_trajectory();
-  EXPECT_DOUBLE_EQ(traj.duration(), 11.5);
   for (size_t k = 0; k < traj.knots().size(); ++k) {
     const auto & knot = traj.knots()[k];
     const auto p = traj.sample(traj.knot_time(k));
     EXPECT_LT((p.position - knot.position).norm(), 1e-9) << "knot " << k;
     EXPECT_LT((p.velocity - knot.velocity).norm(), 1e-9) << "knot " << k;
     EXPECT_LT((p.acceleration - knot.acceleration).norm(), 1e-9) << "knot " << k;
-    EXPECT_NEAR(wrap_angle(p.yaw - knot.yaw), 0.0, 1e-9) << "knot " << k;
-    EXPECT_NEAR(p.yaw_rate, 0.0, 1e-9) << "knot " << k;
   }
   expect_at_rest(traj, 0.0);
   expect_at_rest(traj, traj.duration());
-  EXPECT_LT((traj.sample(100.0).position - Eigen::Vector3d(3, 5, 3)).norm(), 1e-9);
+}
+
+TEST(WaypointTrajectory, YawFollowsItsTurns)
+{
+  const auto traj = corner_trajectory();
+  EXPECT_DOUBLE_EQ(traj.knot_time(3), 11.5);
+  EXPECT_DOUBLE_EQ(traj.duration(), 12.5);  // second turn ends after the last knot
+  EXPECT_NEAR(traj.sample(0.9).yaw, 0.0, 1e-12);
+  EXPECT_DOUBLE_EQ(traj.sample(0.9).yaw_rate, 0.0);
+  EXPECT_NEAR(traj.sample(4.0).yaw, M_PI_2, 1e-12);
+  EXPECT_NEAR(traj.sample(7.0).yaw, M_PI_2, 1e-12);
+  EXPECT_DOUBLE_EQ(traj.sample(7.0).yaw_rate, 0.0);
+  EXPECT_NEAR(traj.sample(12.5).yaw, 3.0, 1e-12);
+  // Holds the last knot while the final turn finishes.
+  EXPECT_LT((traj.sample(12.0).position - Eigen::Vector3d(3, 5, 3)).norm(), 1e-9);
+  EXPECT_GT(traj.sample(12.0).yaw_rate, 0.0);
 }
 
 TEST(WaypointTrajectory, ContinuousAcrossKnots)
@@ -272,7 +282,7 @@ TEST(WaypointTrajectory, StaysOnSegmentsWhenStoppingAtKnots)
   knots[0].position = {0, 0, 1};
   knots[1].position = {2, 1, 1};
   knots[2].position = {2, 4, 2};
-  const WaypointTrajectory traj(knots, {3.0, 4.0});
+  const WaypointTrajectory traj(knots, {3.0, 4.0}, 0.0);
   for (double t = 0; t <= traj.duration(); t += 0.05) {
     const Eigen::Vector3d p = traj.sample(t).position;
     const size_t k = t < 3.0 ? 0 : 1;
@@ -281,24 +291,25 @@ TEST(WaypointTrajectory, StaysOnSegmentsWhenStoppingAtKnots)
   }
 }
 
-TEST(WaypointTrajectory, YawTakesTheShortWayBetweenKnots)
+TEST(WaypointTrajectory, TurnsTakeTheShortWay)
 {
   std::vector<WaypointTrajectory::Knot> knots(2);
   knots[1].position = {1, 0, 0};
-  knots[0].yaw = 3.0;
-  knots[1].yaw = -3.0;
-  const WaypointTrajectory traj(knots, {2.0});
+  const WaypointTrajectory traj(knots, {2.0}, 3.0, {{0.0, 2.0, -3.0}});
   for (double t = 0; t <= 2.0; t += 0.01) {
     EXPECT_GE(traj.sample(t).yaw_rate, 0.0);
   }
+  EXPECT_NEAR(wrap_angle(traj.sample(2.0).yaw + 3.0), 0.0, 1e-12);
 }
 
 TEST(WaypointTrajectory, RejectsBadInput)
 {
   std::vector<WaypointTrajectory::Knot> knots(2);
   knots[1].position = {1, 0, 0};
-  EXPECT_THROW(WaypointTrajectory(knots, {}), std::invalid_argument);
-  EXPECT_THROW(WaypointTrajectory(knots, {0.0}), std::invalid_argument);
+  EXPECT_THROW(WaypointTrajectory(knots, {}, 0.0), std::invalid_argument);
+  EXPECT_THROW(WaypointTrajectory(knots, {0.0}, 0.0), std::invalid_argument);
+  EXPECT_THROW(WaypointTrajectory(knots, {1.0}, 0.0, {{0.0, 1.0, 1.0}, {0.5, 1.0, 2.0}}),
+    std::invalid_argument);  // overlapping turns
   knots[1].velocity = {0.1, 0, 0};
-  EXPECT_THROW(WaypointTrajectory(knots, {1.0}), std::invalid_argument);
+  EXPECT_THROW(WaypointTrajectory(knots, {1.0}, 0.0), std::invalid_argument);
 }
