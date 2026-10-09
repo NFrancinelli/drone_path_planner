@@ -1,8 +1,8 @@
 // Streams trajectory setpoints to PX4 in offboard mode.
 //
 // Mission: wait for PX4, pre-stream setpoints, switch to offboard, arm, take off, then
-// either fly a figure-eight and land, or (figure_eight.enabled = false) hover and fly the
-// trajectories the planner sends on `trajectory`, holding position between them.
+// hover and fly the trajectories the planner sends on `trajectory`, holding position
+// between them; or (figure_eight.enabled) fly a figure-eight and land.
 // A trajectory is only accepted while hovering, and must start where the drone holds;
 // the drone first turns in place to face along it.
 //
@@ -65,8 +65,8 @@ public:
     body_frame_ = declare_parameter("body_frame", std::string("base_link"));
     prestream_time_ = declare_parameter("prestream_time", 1.0);
     hover_time_ = declare_parameter("hover_time", 2.0);
-    // false: take off, hold position and fly the planner's trajectories.
-    fly_figure_eight_ = declare_parameter("figure_eight.enabled", true);
+    // true: fly a figure-eight and land instead of the planner's trajectories.
+    fly_figure_eight_ = declare_parameter("figure_eight.enabled", false);
     // Planner trajectories must start this close to the hold point [m].
     max_start_error_ = declare_parameter("max_start_error", 0.3);
     fig8_.half_length = declare_parameter("figure_eight.half_length", fig8_.half_length);
@@ -251,12 +251,13 @@ private:
   // PX4 local frame -> world frame offset, from the TF pose and PX4's estimate of the same
   // pose. Only valid while the drone is still (on the ground, before arming), when the
   // latest of each describe the same instant. EKF2 reports a valid position before it
-  // has fused the first vision heights, so wait until the offset has been steady for a
-  // while. Returns true once it has.
+  // has fused the first vision heights, so wait until the offset has stayed within a few
+  // cm for a while, and average it over that time (EKF2's height wanders ~1-2 cm while
+  // landed). Returns true once done.
   bool measure_px4_offset()
   {
-    constexpr double kSteadyTime = 2.0;       // [s]
-    constexpr double kSteadyTolerance = 0.01;  // [m]
+    constexpr double kSteadyTime = 2.0;        // [s]
+    constexpr double kSteadyTolerance = 0.03;  // [m]
     geometry_msgs::msg::TransformStamped tf;
     try {
       tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
@@ -270,11 +271,15 @@ private:
     if (!steady_since_ || (offset - steady_offset_).norm() > kSteadyTolerance) {
       steady_offset_ = offset;
       steady_since_ = now();
+      offset_sum_.setZero();
+      offset_samples_ = 0;
     }
+    offset_sum_ += offset;
+    ++offset_samples_;
     if ((now() - *steady_since_).seconds() < kSteadyTime) {
       return false;
     }
-    px4_offset_ = offset;
+    px4_offset_ = offset_sum_ / offset_samples_;
     xy_resets_ = position_->xy_reset_counter;
     z_resets_ = position_->z_reset_counter;
     have_offset_ = true;
@@ -477,7 +482,9 @@ private:
   Eigen::Vector3d px4_offset_{Eigen::Vector3d::Zero()};  // world = PX4 local (ENU) + offset
   bool have_offset_{false};
   std::optional<rclcpp::Time> steady_since_;  // offset within tolerance of steady_offset_
-  Eigen::Vector3d steady_offset_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d steady_offset_{Eigen::Vector3d::Zero()};  // first offset of the window
+  Eigen::Vector3d offset_sum_{Eigen::Vector3d::Zero()};
+  int offset_samples_{0};
   uint8_t xy_resets_{0}, z_resets_{0};
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

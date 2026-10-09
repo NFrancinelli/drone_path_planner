@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Factory hall for the replanning demo (drone starts at the origin facing +x, goal (19.5, 0)).
+     Top view, x east, y north:
+       - shelving row at x = 2 with a 1.5 m gap at y = 1.5..3: the drone has to swerve left;
+       - two shelving blocks (x = 5..17.6) leaving a 1.5 m corridor along y = 0, closed at
+         x = 17 by a 3 m crate wall: a dead end the camera (10 m range) only sees from
+         inside the corridor;
+       - 3.2 m side aisles (y = 6..9.2 and mirrored) around the blocks: the long way round;
+       - open space behind the crates up to the hall's end wall, which the camera sees over
+         the crates, so the space above them gets mapped.
+     Walls and shelving are 5 m tall, above the planner's 4 m ceiling; only the crates can
+     be flown over. Nothing overhangs the flight path. -->
+<sdf version="1.9">
+  <world name="factory">
+    <physics type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>250</real_time_update_rate>
+    </physics>
+    <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic"/>
+    <scene>
+      <grid>false</grid>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+      <shadows>false</shadows>
+    </scene>
+    <light name="sun" type="directional">
+      <pose>0 0 50 0 0 0</pose>
+      <cast_shadows>false</cast_shadows>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+      <direction>0.3 0.6 -0.8</direction>
+    </light>
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>47.397971057728974</latitude_deg>
+      <longitude_deg>8.546163739800146</longitude_deg>
+      <elevation>0</elevation>
+    </spherical_coordinates>
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material><ambient>0.8 0.8 0.8 1</ambient><diffuse>0.8 0.8 0.8 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <!-- Hall: 5 m walls, no roof. -->
+    <model name="hall_west">
+      <static>true</static>
+      <pose>-3.35 0 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 19 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 19 5</size></box></geometry>
+          <material><ambient>0.75 0.75 0.78 1</ambient><diffuse>0.75 0.75 0.78 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="hall_east">
+      <static>true</static>
+      <pose>21.85 0 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.3 19 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 19 5</size></box></geometry>
+          <material><ambient>0.75 0.75 0.78 1</ambient><diffuse>0.75 0.75 0.78 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="hall_north">
+      <static>true</static>
+      <pose>9.25 9.35 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>25.5 0.3 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>25.5 0.3 5</size></box></geometry>
+          <material><ambient>0.75 0.75 0.78 1</ambient><diffuse>0.75 0.75 0.78 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="hall_south">
+      <static>true</static>
+      <pose>9.25 -9.35 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>25.5 0.3 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>25.5 0.3 5</size></box></geometry>
+          <material><ambient>0.75 0.75 0.78 1</ambient><diffuse>0.75 0.75 0.78 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <!-- Shelving row with a 1.5 m gap at y = 1.5..3. -->
+    <model name="row_north">
+      <static>true</static>
+      <pose>2.3 6.1 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.6 6.2 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.6 6.2 5</size></box></geometry>
+          <material><ambient>0.35 0.45 0.6 1</ambient><diffuse>0.35 0.45 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="row_south">
+      <static>true</static>
+      <pose>2.3 -3.85 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.6 10.7 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.6 10.7 5</size></box></geometry>
+          <material><ambient>0.35 0.45 0.6 1</ambient><diffuse>0.35 0.45 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <!-- Shelving blocks forming the 1.5 m corridor. -->
+    <model name="block_north">
+      <static>true</static>
+      <pose>11.3 3.375 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>12.6 5.25 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>12.6 5.25 5</size></box></geometry>
+          <material><ambient>0.35 0.45 0.6 1</ambient><diffuse>0.35 0.45 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <model name="block_south">
+      <static>true</static>
+      <pose>11.3 -3.375 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>12.6 5.25 5</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>12.6 5.25 5</size></box></geometry>
+          <material><ambient>0.35 0.45 0.6 1</ambient><diffuse>0.35 0.45 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <!-- Dead end: 3 m crate wall closing the corridor; the only way past is over it. -->
+    <model name="crate_wall">
+      <static>true</static>
+      <pose>17.3 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="c00"><pose>0 -0.375 0.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry></collision>
+        <visual name="v00">
+          <pose>0 -0.375 0.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry>
+          <material><ambient>0.7 0.5 0.3 1</ambient><diffuse>0.7 0.5 0.3 1</diffuse></material>
+        </visual>
+        <collision name="c01"><pose>0 -0.375 1.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry></collision>
+        <visual name="v01">
+          <pose>0 -0.375 1.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry>
+          <material><ambient>0.7 0.5 0.3 1</ambient><diffuse>0.7 0.5 0.3 1</diffuse></material>
+        </visual>
+        <collision name="c02"><pose>0 -0.375 2.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry></collision>
+        <visual name="v02">
+          <pose>0 -0.375 2.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry>
+          <material><ambient>0.7 0.5 0.3 1</ambient><diffuse>0.7 0.5 0.3 1</diffuse></material>
+        </visual>
+        <collision name="c10"><pose>0 0.375 0.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry></collision>
+        <visual name="v10">
+          <pose>0 0.375 0.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry>
+          <material><ambient>0.7 0.5 0.3 1</ambient><diffuse>0.7 0.5 0.3 1</diffuse></material>
+        </visual>
+        <collision name="c11"><pose>0 0.375 1.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry></collision>
+        <visual name="v11">
+          <pose>0 0.375 1.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry>
+          <material><ambient>0.7 0.5 0.3 1</ambient><diffuse>0.7 0.5 0.3 1</diffuse></material>
+        </visual>
+        <collision name="c12"><pose>0 0.375 2.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry></collision>
+        <visual name="v12">
+          <pose>0 0.375 2.5 0 0 0</pose><geometry><box><size>0.6 0.75 1</size></box></geometry>
+          <material><ambient>0.7 0.5 0.3 1</ambient><diffuse>0.7 0.5 0.3 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

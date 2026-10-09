@@ -3,11 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <queue>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
-#include "path_planner/inflated_map.hpp"
 
 namespace path_planner
 {
@@ -61,10 +61,30 @@ AStarPlanner::AStarPlanner(const Params & params)
 {
 }
 
+double step_weight(const AStarPlanner::Params & params, const DistanceMap & map, const Key & k)
+{
+  double weight = map.at(k) == Occupancy::Unknown ? 1.0 + params.unknown_cost : 1.0;
+  const double band = params.clearance_radius - params.inflation_radius;
+  if (band > 0.0) {
+    const double closeness = (params.clearance_radius - map.distance(k)) / band;
+    weight += params.clearance_cost * std::clamp(closeness, 0.0, 1.0);
+  }
+  return weight;
+}
+
 AStarPlanner::Result AStarPlanner::plan(
   const OccupancyMap & map, const Eigen::Vector3d & start, const Eigen::Vector3d & goal) const
 {
+  return plan(DistanceMap(map, p_.bounds, max_distance()), start, goal);
+}
+
+AStarPlanner::Result AStarPlanner::plan(
+  const DistanceMap & map, const Eigen::Vector3d & start, const Eigen::Vector3d & goal) const
+{
   static const std::vector<Step> kNeighbours = make_neighbours();
+  if (map.max_distance() < max_distance() - 1e-9) {
+    throw std::invalid_argument("Distance map too short-ranged for these planner params");
+  }
 
   Result result;
   const double res = map.resolution();
@@ -81,8 +101,8 @@ AStarPlanner::Result AStarPlanner::plan(
     return result;
   }
 
-  const InflatedMap inflated(map, p_.inflation_radius);
-  if (inflated.blocked(goal_key)) {
+  const auto blocked = [&](const Key & k) {return map.distance(k) <= p_.inflation_radius;};
+  if (blocked(goal_key)) {
     result.status = Status::GoalBlocked;
     return result;
   }
@@ -130,10 +150,10 @@ AStarPlanner::Result AStarPlanner::plan(
 
     for (const Step & step : kNeighbours) {
       const Key next = node.key + step.offset;
-      if (closed.count(next) || !in_bounds(next) || inflated.blocked(next)) {
+      if (closed.count(next) || !in_bounds(next) || blocked(next)) {
         continue;
       }
-      const double weight = map.at(next) == Occupancy::Unknown ? 1.0 + p_.unknown_cost : 1.0;
+      const double weight = step_weight(p_, map, next);
       const double cost = node.g + (step.length * weight + p_.vertical_cost * step.climb) * res;
       auto [it, inserted] = g.try_emplace(next, cost);
       if (!inserted && cost >= it->second) {

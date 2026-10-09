@@ -6,7 +6,7 @@
 #include <Eigen/Core>
 
 #include "path_planner/astar.hpp"
-#include "path_planner/occupancy_map.hpp"
+#include "path_planner/distance_map.hpp"
 #include "trajectory_server/trajectory.hpp"
 
 namespace path_planner
@@ -15,10 +15,10 @@ namespace path_planner
 // Greedy shortcut of an A* path: from each kept waypoint, jump to the farthest later one
 // whose straight segment is clear of the inflated map and costs no more than the path it
 // replaces (same inflation and cost weighting as the A* params, so it never cuts through
-// unknown space the planner went around). The start voxel is exempt from the clearance
-// check, as in A*.
+// unknown space the planner went around, or closer to obstacles than it went). The start
+// voxel is exempt from the clearance check, as in A*.
 std::vector<Eigen::Vector3d> shortcut(
-  const OccupancyMap & map, const std::vector<Eigen::Vector3d> & path,
+  const DistanceMap & map, const std::vector<Eigen::Vector3d> & path,
   const AStarPlanner::Params & params);
 
 struct SmoothingParams
@@ -48,7 +48,7 @@ struct SmoothingResult
 // reaches its corner (or as soon as possible after, when corners are close); climbs keep
 // the heading. The caller turns the drone to the first leg's heading beforehand.
 SmoothingResult smooth(
-  const OccupancyMap & map, const std::vector<Eigen::Vector3d> & waypoints,
+  const DistanceMap & map, const std::vector<Eigen::Vector3d> & waypoints,
   const SmoothingParams & params);
 
 }  // namespace path_planner

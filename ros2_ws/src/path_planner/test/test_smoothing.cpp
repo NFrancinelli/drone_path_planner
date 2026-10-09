@@ -6,13 +6,11 @@
 #include <gtest/gtest.h>
 
 #include "path_planner/astar.hpp"
-#include "path_planner/inflated_map.hpp"
 #include "path_planner/smoothing.hpp"
 #include "trajectory_server/frames.hpp"
 #include "test_map.hpp"
 
 using path_planner::AStarPlanner;
-using path_planner::InflatedMap;
 using path_planner::SmoothingParams;
 using path_planner::shortcut;
 using path_planner::smooth;
@@ -107,7 +105,7 @@ TEST(Shortcut, StraightensZigZagInFreeSpace)
 {
   const TestMap map(Occupancy::Free);
   const Path zigzag{{0, 0, 2}, {0.5, 0.5, 2}, {1, 0, 2}, {1.5, 0.5, 2}, {2, 0, 2}};
-  const Path out = shortcut(map, zigzag, AStarPlanner::Params{});
+  const Path out = shortcut(distances(map), zigzag, AStarPlanner::Params{});
   ASSERT_EQ(out.size(), 2u);
   EXPECT_EQ(out.front(), zigzag.front());
   EXPECT_EQ(out.back(), zigzag.back());
@@ -123,15 +121,15 @@ TEST(Shortcut, KeepsClearanceThroughGap)
   const auto raw = AStarPlanner(params).plan(map, start, goal);
   ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
 
-  const Path out = shortcut(map, raw.path, params);
+  const Path out = shortcut(distances(map), raw.path, params);
   EXPECT_LT(out.size(), raw.path.size());
   EXPECT_LE(out.size(), 5u);
   EXPECT_EQ(out.front(), start);
   EXPECT_EQ(out.back(), goal);
   EXPECT_LE(length(out), length(raw.path) + 1e-9);
-  const InflatedMap inflated(map, params.inflation_radius);
+  const auto dist = distances(map);
   for (const auto & p : densify(map, out)) {
-    EXPECT_FALSE(inflated.blocked(p)) << p.transpose();
+    EXPECT_GT(dist.distance(dist.key(p)), params.inflation_radius) << p.transpose();
   }
 }
 
@@ -148,7 +146,7 @@ TEST(Shortcut, DoesNotCutThroughUnknownTheSearchAvoided)
   const auto raw = AStarPlanner(params).plan(map, {0.125, 0.125, kLayerZ}, {4.125, 0.125, kLayerZ});
   ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
 
-  const Path out = shortcut(map, raw.path, params);
+  const Path out = shortcut(distances(map), raw.path, params);
   EXPECT_LT(out.size(), raw.path.size());
   for (const auto & p : densify(map, out)) {
     EXPECT_EQ(map.at(map.key(p)), Occupancy::Free) << p.transpose();
@@ -159,7 +157,7 @@ TEST(Smooth, KeepsMovingThroughFreeCorner)
 {
   const TestMap map(Occupancy::Free);
   const SmoothingParams params;
-  const auto result = smooth(map, kCorner, params);
+  const auto result = smooth(distances(map), kCorner, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   EXPECT_EQ(result.stopped_knots, 0);
@@ -178,15 +176,16 @@ TEST(Smooth, StopsAtCornerWhenTheCurveWouldHitAnObstacle)
   TestMap map(Occupancy::Free);
   map.set_box({2.9, -0.3, 1.5}, {2.9, -0.3, 2.8}, Occupancy::Occupied);
   const SmoothingParams params;
-  const auto result = smooth(map, kCorner, params);
+  const auto result = smooth(distances(map), kCorner, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   EXPECT_EQ(result.stopped_knots, 1);
   EXPECT_EQ(traj.knots().size(), 3u);  // start, stopped corner, goal
   EXPECT_LT(traj.sample(traj.knot_time(knot_at(traj, kCorner[1]))).velocity.norm(), 1e-9);
-  const InflatedMap clearance(map, params.collision_radius);
+  const auto dist = distances(map);
   for (double t = 0.0; t <= traj.duration(); t += 0.02) {
-    EXPECT_FALSE(clearance.blocked(traj.sample(t).position)) << "t = " << t;
+    const auto k = dist.key(traj.sample(t).position);
+    EXPECT_GT(dist.distance(k), params.collision_radius) << "t = " << t;
   }
   expect_within_limits(traj, params);
 }
@@ -195,7 +194,7 @@ TEST(Smooth, YawFacesEachLegByItsCornerAndHoldsThroughClimbs)
 {
   const TestMap map(Occupancy::Free);
   const Path path{{0, 0, 1}, {2, 0, 1}, {2, 0, 3}, {2, 2, 3}};
-  const auto result = smooth(map, path, SmoothingParams{});
+  const auto result = smooth(distances(map), path, SmoothingParams{});
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   const auto yaw_at = [&](const Eigen::Vector3d & p) {
@@ -211,8 +210,8 @@ TEST(Smooth, YawFacesEachLegByItsCornerAndHoldsThroughClimbs)
 TEST(Smooth, RejectsDegeneratePath)
 {
   const TestMap map(Occupancy::Free);
-  EXPECT_FALSE(smooth(map, {{1, 1, 1}}, SmoothingParams{}).trajectory);
-  EXPECT_FALSE(smooth(map, {{1, 1, 1}, {1, 1, 1}}, SmoothingParams{}).trajectory);
+  EXPECT_FALSE(smooth(distances(map), {{1, 1, 1}}, SmoothingParams{}).trajectory);
+  EXPECT_FALSE(smooth(distances(map), {{1, 1, 1}, {1, 1, 1}}, SmoothingParams{}).trajectory);
 }
 
 TEST(Smooth, CornersStayCloseToTheStraightPath)
@@ -222,8 +221,8 @@ TEST(Smooth, CornersStayCloseToTheStraightPath)
   const TestMap map(Occupancy::Free);
   const SmoothingParams params;
   const Path shallow{{0, 0, 2}, {4, 0, 2}, {7, 2.5, 2}};  // ~40 deg turn
-  const auto sharp = smooth(map, kCorner, params);
-  const auto gentle = smooth(map, shallow, params);
+  const auto sharp = smooth(distances(map), kCorner, params);
+  const auto gentle = smooth(distances(map), shallow, params);
   ASSERT_TRUE(sharp.trajectory);
   ASSERT_TRUE(gentle.trajectory);
   EXPECT_LT(max_deviation(*sharp.trajectory, kCorner), 0.15);
@@ -245,7 +244,7 @@ TEST(Smooth, CloseCornersDoNotSlowTheFlightForYaw)
   const TestMap map(Occupancy::Free);
   const Path path{{0, 0, 2.77}, {1.1, 0.9, 2.7}, {1.7, 1.5, 2.5}, {2.1, 1.9, 2.5}, {2.0, 6.5, 2.5}};
   const SmoothingParams params;
-  const auto result = smooth(map, path, params);
+  const auto result = smooth(distances(map), path, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   for (size_t k = 1; k + 1 < path.size(); ++k) {

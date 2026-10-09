@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
-#include "path_planner/inflated_map.hpp"
 #include "trajectory_server/frames.hpp"
 
 namespace path_planner
@@ -25,20 +25,18 @@ struct SegmentCheck
 
 // Samples a -> b every quarter voxel. Cost uses the A* weighting per sampled voxel.
 SegmentCheck check_segment(
-  const InflatedMap & inflated, const Key & exempt, const Eigen::Vector3d & a,
+  const DistanceMap & map, const Key & exempt, const Eigen::Vector3d & a,
   const Eigen::Vector3d & b, const AStarPlanner::Params & params)
 {
-  const OccupancyMap & map = inflated.map();
   const double length = (b - a).norm();
   const int n = std::max(1, static_cast<int>(std::ceil(length / (0.25 * map.resolution()))));
   SegmentCheck check;
   for (int i = 1; i <= n; ++i) {
     const Key k = map.key(a + (b - a) * (static_cast<double>(i) / n));
-    if (k != exempt && inflated.blocked(k)) {
+    if (k != exempt && map.distance(k) <= params.inflation_radius) {
       check.clear = false;
     }
-    const double weight = map.at(k) == Occupancy::Unknown ? 1.0 + params.unknown_cost : 1.0;
-    check.cost += weight * length / n;
+    check.cost += step_weight(params, map, k) * length / n;
   }
   check.cost += params.vertical_cost * std::abs(b.z() - a.z());
   return check;
@@ -96,20 +94,19 @@ double segment_duration(
 }  // namespace
 
 std::vector<Eigen::Vector3d> shortcut(
-  const OccupancyMap & map, const std::vector<Eigen::Vector3d> & path,
+  const DistanceMap & map, const std::vector<Eigen::Vector3d> & path,
   const AStarPlanner::Params & params)
 {
   if (path.size() <= 2) {
     return path;
   }
-  const InflatedMap inflated(map, params.inflation_radius);
   const Key exempt = map.key(path.front());
 
   // Cost of the original path up to each waypoint, measured like the shortcuts.
   std::vector<double> cost_to{0.0};
   for (size_t i = 1; i < path.size(); ++i) {
     cost_to.push_back(
-      cost_to.back() + check_segment(inflated, exempt, path[i - 1], path[i], params).cost);
+      cost_to.back() + check_segment(map, exempt, path[i - 1], path[i], params).cost);
   }
 
   std::vector<Eigen::Vector3d> out{path.front()};
@@ -117,7 +114,7 @@ std::vector<Eigen::Vector3d> shortcut(
   while (i + 1 < path.size()) {
     size_t next = i + 1;
     for (size_t j = path.size() - 1; j > i + 1; --j) {
-      const auto seg = check_segment(inflated, exempt, path[i], path[j], params);
+      const auto seg = check_segment(map, exempt, path[i], path[j], params);
       if (seg.clear && seg.cost <= cost_to[j] - cost_to[i] + 1e-9) {
         next = j;
         break;
@@ -130,9 +127,12 @@ std::vector<Eigen::Vector3d> shortcut(
 }
 
 SmoothingResult smooth(
-  const OccupancyMap & map, const std::vector<Eigen::Vector3d> & waypoints,
+  const DistanceMap & map, const std::vector<Eigen::Vector3d> & waypoints,
   const SmoothingParams & params)
 {
+  if (map.max_distance() < params.collision_radius - 1e-9) {
+    throw std::invalid_argument("Distance map too short-ranged for collision_radius");
+  }
   SmoothingResult result;
 
   std::vector<Eigen::Vector3d> pts;
@@ -191,7 +191,6 @@ SmoothingResult smooth(
     c.rounded = c.speed > kMinCornerSpeed;
   }
 
-  const InflatedMap clearance(map, params.collision_radius);
   const Key exempt = map.key(pts.front());
   const double dt = 0.25 * map.resolution() / params.max_vel;
   std::vector<bool> stopped(n, false);
@@ -294,7 +293,7 @@ SmoothingResult smooth(
         too_fast[seg] = true;
       }
       const Key key = map.key(p.position);
-      if (key != exempt && clearance.blocked(key)) {
+      if (key != exempt && map.distance(key) <= params.collision_radius) {
         collides[seg] = true;
       }
       if (t >= traj->duration()) {

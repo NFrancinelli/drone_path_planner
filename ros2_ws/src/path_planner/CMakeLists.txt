@@ -23,7 +23,7 @@ find_package(trajectory_server REQUIRED)
 find_package(drone_interfaces REQUIRED)
 
 # ROS-independent core: search and smoothing on an abstract voxel map.
-add_library(planner_core src/astar.cpp src/inflated_map.cpp src/smoothing.cpp)
+add_library(planner_core src/astar.cpp src/distance_map.cpp src/smoothing.cpp)
 target_include_directories(planner_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -41,6 +41,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_astar test/test_astar.cpp)
   target_link_libraries(test_astar planner_core)
+  ament_add_gtest(test_distance_map test/test_distance_map.cpp)
+  target_link_libraries(test_distance_map planner_core)
   ament_add_gtest(test_smoothing test/test_smoothing.cpp)
   target_link_libraries(test_smoothing planner_core)
   ament_add_gtest(test_octomap_map test/test_octomap_map.cpp)

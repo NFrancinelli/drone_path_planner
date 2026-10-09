@@ -45,6 +45,8 @@ public:
     params.inflation_radius = declare_parameter("inflation_radius", params.inflation_radius);
     params.unknown_cost = declare_parameter("unknown_cost", params.unknown_cost);
     params.vertical_cost = declare_parameter("vertical_cost", params.vertical_cost);
+    params.clearance_radius = declare_parameter("clearance_radius", params.clearance_radius);
+    params.clearance_cost = declare_parameter("clearance_cost", params.clearance_cost);
     params.max_expansions =
       static_cast<int>(declare_parameter("max_expansions", params.max_expansions));
     const auto lo = declare_parameter("bounds_min", std::vector<double>{-20.0, -20.0, 0.5});
@@ -123,11 +125,15 @@ private:
       return;
     }
 
-    const OctomapMap map(tree);
+    // One distance map for the search, shortcut and smoothing.
+    const OctomapMap octomap(tree);
+    const auto t_map = std::chrono::steady_clock::now();
+    const DistanceMap map(octomap, planner_->params().bounds, planner_->max_distance());
     const auto t0 = std::chrono::steady_clock::now();
     const auto result = planner_->plan(map, start, goal);
     const double ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double map_ms = std::chrono::duration<double, std::milli>(t0 - t_map).count();
 
     if (result.status != AStarPlanner::Status::Success) {
       RCLCPP_WARN(get_logger(), "No path from (%.2f, %.2f, %.2f): %s (%d expansions, %.1f ms)",
@@ -136,8 +142,9 @@ private:
       clear_paths();
       return;
     }
-    RCLCPP_INFO(get_logger(), "Path: %zu points, cost %.2f, %d expansions, %.1f ms",
-      result.path.size(), result.cost, result.expansions, ms);
+    RCLCPP_INFO(get_logger(),
+      "Path: %zu points, cost %.2f, %d expansions, %.1f ms (distance map %.1f ms)",
+      result.path.size(), result.cost, result.expansions, ms, map_ms);
     publish_path(*path_pub_, result.path, {});
 
     const auto t1 = std::chrono::steady_clock::now();

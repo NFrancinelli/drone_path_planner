@@ -4,6 +4,7 @@
 
 #include <Eigen/Geometry>
 
+#include "path_planner/distance_map.hpp"
 #include "path_planner/occupancy_map.hpp"
 
 namespace test
@@ -50,6 +51,13 @@ private:
   Occupancy fill_;
   std::unordered_map<Key, Occupancy, KeyHash> cells_;
 };
+
+// Distance map over the area the shortcut and smoothing tests use.
+inline path_planner::DistanceMap distances(const OccupancyMap & map, double max_distance = 1.0)
+{
+  const Eigen::AlignedBox3d area(Eigen::Vector3d(-3.0, -3.0, 0.0), Eigen::Vector3d(10.0, 10.0, 4.0));
+  return path_planner::DistanceMap(map, area, max_distance);
+}
 
 // Bounds with a single voxel layer at kLayerZ (2D tests).
 inline Eigen::AlignedBox3d flat_bounds(double x0, double y0, double x1, double y1)
