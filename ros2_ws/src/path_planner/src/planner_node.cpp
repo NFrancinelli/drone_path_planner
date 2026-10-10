@@ -159,6 +159,18 @@ public:
       "goal_pose", 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {on_goal(*msg);});
 
+    // Distance flown at max_vel between an obstacle appearing and the drone stopping: until
+    // the brake takes effect (map update and PX4 response ~0.2 s each, the check period, the
+    // brake lead), then the brake itself (a quintic stop: 1.875 v / a long, covering v T / 2).
+    // Obstacles must come into view at least this far away: the camera sees 10 m, but
+    // occluding corners can hide one until much closer.
+    const double v = smoothing_.max_vel;
+    const double reaction = 0.2 + check_period + kBrakeLead + 0.2;
+    const double braking = 1.875 * v * v / (2.0 * smoothing_.max_acc);
+    RCLCPP_INFO(get_logger(), "Stopping distance at %.1f m/s: %.1f m (%.2f s to react, %.1f m to "
+      "brake), plus PX4's tracking error (~%.0f%% speed overshoot at this acceleration)",
+      v, v * reaction + braking, reaction, braking, 16.0 * smoothing_.max_acc);
+
     check_timer_ = create_wall_timer(
       std::chrono::duration<double>(check_period), [this]() {check();});
     improve_timer_ = create_wall_timer(

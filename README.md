@@ -101,6 +101,34 @@ climbs over the crates and stops within 15 cm of the goal, in about 40 s. Main `
 | `max_vel`, `max_acc` | 1.0 m/s, 1.0 m/s² | Trajectory limits |
 | `bounds_min`, `bounds_max` | (−20, −20, 0.5), (20, 20, 4) m | Search volume |
 
+## Speed and safety
+
+The drone must be able to stop before an obstacle it has just discovered. From the moment
+an obstacle shows up in the camera to the drone stopping, at `max_vel` = 1 m/s and
+`max_acc` = 1 m/s²:
+
+| | |
+|---|---|
+| Reaction, until the brake takes effect | ~0.75 s: map update ~0.2 s, collision check ≤ 0.2 s, brake lead 0.15 s, PX4 response ~0.2 s |
+| Distance flown meanwhile | ~0.9 m (at the 1.18 m/s peak, see below) |
+| Braking (quintic stop, 1.875 v / a long) | 0.94 m |
+| PX4 tracking error | up to 0.18 m |
+| **Total** | **~2.0 m** |
+
+The camera sees 10 m, so in the open 1 m/s is well within limits. Occlusion is the binding
+case: an obstacle hidden behind a corner can first appear much closer, like the face of the
+shelving block that comes into view ~2.5 m away as the drone passes the gap in `factory`.
+That's about the margin above; flying faster would need slowing down near occluding corners.
+
+PX4 overshoots the commanded speed after each acceleration: the drone trails the setpoint
+while it tilts into the acceleration (~0.14 m/s behind on a 1 m/s² ramp), and its position
+loop then makes up the distance. Measured on a straight 10 m leg, the overshoot scales with
+`max_acc`: 16 % at 1 m/s² (peak 1.18 m/s), 10 % at 0.7, 4 % at 0.5. PX4's velocity gains
+barely change it (13–16 %). Lower acceleration tracks better but brakes longer (2.3 m and
+2.7 m total stopping distance), so 1 m/s² stays the default. The planner logs the stopping
+distance for its parameters at startup (reaction and braking, without the overshoot and
+tracking error).
+
 ## Measuring a flight
 
 `mission_metrics.py` sends a goal like RViz does, waits for the planner to reach it, and
@@ -171,6 +199,6 @@ server are stamped with system time.
   to the real surface: `inflation_radius` (0.5 m) guarantees only ~0.4 m, barely more than
   the drone's 0.39 m radius. The clearance cost keeps paths centred (~0.35 m of margin each
   side in a 1.5 m gap); the thin worst case needs an off-centre squeeze.
-- PX4 overshoots the commanded speed: peaks of ~1.35 m/s at the 1 m/s cruise.
+- PX4 overshoots the commanded speed by ~16 % after accelerating (see Speed and safety).
 - Obstacles are sticky (static worlds only): a moving obstacle, or a noisy depth reading,
   would stay in the planner's map for good.
