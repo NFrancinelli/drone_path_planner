@@ -15,6 +15,9 @@ Project page: https://nfrancinelli.github.io/projects/3d-planner/
   - [x] Path shortcutting and smooth trajectory, collision-checked against the map
   - [x] Trajectory server flies the planned trajectory
 - [ ] Milestone 4 – replanning in the factory world
+  - [x] `factory` world: 1.5 m gaps, a corridor dead-ending at a crate wall
+  - [x] New plans take over a trajectory in flight without a jump
+  - [x] Replanning when the path gets blocked, switching to clearly shorter ways, braking when stuck
 - [ ] Milestone 5 – unknown-cost comparison + demo video
 
 ## Quick start
@@ -57,11 +60,22 @@ plans from the drone's current position on the latest OctoMap and shows:
 
 The planner sends the trajectory to the trajectory server (`drone_interfaces/WaypointTrajectory`
 on `/trajectory`, rebuilt exactly on the other side), which turns the drone to face the first
-leg, flies it and hovers at the goal until the next one. A goal clicked while the drone is
-flying continues the current trajectory: the new one starts `replan_lead` (1 s) ahead on it,
-in exactly its position, velocity, acceleration and heading there, and the server switches
-over at that moment, braking first if the new path heads back. If no path is found, the
-drone carries on (or keeps hovering). Main `path_planner` parameters:
+leg, flies it and hovers at the goal until the next one.
+
+The planner pursues the goal until it's reached, replanning as the map grows:
+
+- the rest of the flown trajectory is checked against every new map (5 Hz); when it runs
+  into a newly seen obstacle, a new plan replaces it;
+- every 2 s, a new plan replaces it if it arrives clearly sooner (by 1 s and 10 %);
+- if a blocked trajectory can't be replanned, the drone brakes to a stop, hovers, and tries
+  again every 2 s as the map fills in.
+
+A new plan, like a goal clicked mid-flight, continues the current trajectory: it starts
+`replan_lead` (1 s) ahead on it, in exactly its position, velocity, acceleration and heading
+there, and the server switches over at that moment, braking first if the new path heads
+back. In the `factory` world, flying from the start to (19.5, 0) behind the crate wall
+takes about a dozen replans as the hall comes into view; the drone discovers the dead end,
+climbs over the crates and lands within 10 cm of the goal. Main `path_planner` parameters:
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -69,9 +83,11 @@ drone carries on (or keeps hovering). Main `path_planner` parameters:
 | `unknown_cost` | 1.0 | Extra cost per metre in unknown space (0 = treat as free) |
 | `vertical_cost` | 1.0 | Extra cost per metre of climb or descent, so paths keep their altitude unless climbing pays off |
 | `clearance_radius`, `clearance_cost` | 1.0 m, 1.0 | Within this distance of an obstacle, extra cost per metre rising to `clearance_cost` at `inflation_radius`: paths run down the middle of gaps |
-| `collision_radius` | 0.4 m | Clearance the smoothed trajectory must keep; ≤ `inflation_radius` |
+| `collision_radius` | 0.45 m | Clearance the smoothed and flown trajectory must keep (drone radius 0.39 m); ≤ `inflation_radius` |
 | `corner_distance` | 0.75 m | How far before and after a corner the rounding starts |
 | `replan_lead` | 1.0 s | How far ahead on the current trajectory a new plan takes over; must cover planning time |
+| `check_period`, `improve_period` | 0.2 s, 2.0 s | How often the flown trajectory is checked against the map, and a shorter way looked for |
+| `improve_min_gain`, `improve_min_ratio` | 1.0 s, 0.1 | How much sooner a new plan must arrive to replace the current one |
 | `max_vel`, `max_acc` | 1.0 m/s, 1.0 m/s² | Trajectory limits |
 | `bounds_min`, `bounds_max` | (−20, −20, 0.5), (20, 20, 4) m | Search volume |
 
@@ -127,5 +143,9 @@ server are stamped with system time.
   below the flight path.
 - Each straight leg of a smoothed trajectory is a single quintic, so its average speed is
   about half of `max_vel`.
-- Each plan rebuilds a distance map over the whole planning volume (~100-130 ms), more than
-  the search itself once the map is known (~20 ms); too slow for frequent replanning yet.
+- Planning takes up to ~0.55 s while most of the hall is unknown (distance map over the
+  whole planning volume ~130 ms, A* up to ~400 ms), within the 1 s `replan_lead`.
+- Clearances are measured between voxel centers, which can be half a voxel (0.1 m) closer
+  to the real surface: `inflation_radius` (0.5 m) guarantees only ~0.4 m, barely more than
+  the drone's 0.39 m radius. The clearance cost keeps paths centred (~0.35 m of margin each
+  side in a 1.5 m gap); the thin worst case needs an off-centre squeeze.

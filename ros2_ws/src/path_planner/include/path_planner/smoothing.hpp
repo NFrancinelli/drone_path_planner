@@ -28,7 +28,7 @@ struct SmoothingParams
   double max_acc{1.0};           // [m/s^2]
   double max_yaw_rate{0.8};      // [rad/s]
   double max_yaw_acc{1.0};       // [rad/s^2]
-  double collision_radius{0.4};  // [m] clearance on the uninflated map, <= inflation radius
+  double collision_radius{0.45};  // [m] clearance on the uninflated map, <= inflation radius
   double corner_distance{0.75};  // [m] how far before and after a corner the turn starts
 };
 
@@ -66,5 +66,17 @@ struct SmoothingResult
 SmoothingResult smooth(
   const DistanceMap & map, const std::vector<Eigen::Vector3d> & waypoints,
   const SmoothingParams & params, const StartState & start = {});
+
+// Stops straight ahead from `start` (moving, at `position`) as fast as the limits allow,
+// then holds, keeping the heading (a turning start winds its yaw rate down). Not collision
+// checked: it's what's left when no plan is found.
+std::shared_ptr<const trajectory_server::WaypointTrajectory> brake(
+  const Eigen::Vector3d & position, const StartState & start, const SmoothingParams & params);
+
+// Time of the first sample of `trajectory` from t0 on (sampled every dt) closer than
+// `radius` to an occupied voxel of `map`, if any.
+std::optional<double> first_collision(
+  const OccupancyMap & map, const trajectory_server::Trajectory & trajectory, double t0,
+  double radius, double dt = 0.05);
 
 }  // namespace path_planner

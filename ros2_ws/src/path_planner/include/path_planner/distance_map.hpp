@@ -28,16 +28,19 @@ public:
   double distance(const Key & k) const;
   double max_distance() const {return max_distance_;}
 
-private:
-  // Flat index of k, or -1 outside the grid.
+  // Flat index of k into the grid, or -1 outside it; for per-voxel arrays (see A*).
   long index(const Key & k) const;
+  long cells() const {return static_cast<long>(distance_.size());}
 
+private:
   const OccupancyMap & map_;
   double max_distance_;
   Key lo_;    // first voxel of the grid
   Key size_;  // voxels along each axis
   std::vector<Occupancy> occupancy_;
-  std::vector<float> distance_;
+  // double, not float: grid distances are sqrt(n) * resolution, and a float 0.4 is just
+  // over 0.4, so a voxel exactly at a radius would count as outside it.
+  std::vector<double> distance_;
 };
 
 }  // namespace path_planner

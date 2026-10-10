@@ -95,9 +95,10 @@ double segment_duration(
 
 // Where a moving start comes to rest when braking straight ahead: the end of the shortest
 // segment from it to rest at p0 + v0 * T / 2 (as if decelerating evenly) that stays within
-// the limits and never moves backwards.
+// the limits and never moves backwards. Its duration goes to `duration` if given.
 WaypointTrajectory::Knot braking_stop(
-  const WaypointTrajectory::Knot & from, const SmoothingParams & params)
+  const WaypointTrajectory::Knot & from, const SmoothingParams & params,
+  double * duration = nullptr)
 {
   const Eigen::Vector3d dir = from.velocity.normalized();
   const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
@@ -115,6 +116,9 @@ WaypointTrajectory::Knot braking_stop(
     if (fits) {
       WaypointTrajectory::Knot stop;
       stop.position = end;
+      if (duration) {
+        *duration = T;
+      }
       return stop;
     }
   }
@@ -408,8 +412,18 @@ SmoothingResult smooth(
           }
         }
         if (!stopped_any) {
-          // A straight leg is too close (the map changed under us), or a moving start
-          // swings too close while turning round.
+          if (j == 0 && !start.velocity.isZero() && !stop) {
+            // A moving start swings too close while turning onto the first leg: brake to a
+            // stop straight ahead first instead (that part is checked next pass too).
+            WaypointTrajectory::Knot from;
+            from.position = pts[0];
+            from.velocity = start.velocity;
+            from.acceleration = start.acceleration;
+            stop = braking_stop(from, params);
+            changed = true;
+            continue;
+          }
+          // A straight leg is too close: the map changed under us.
           result.failure = j == 0 ? "first segment collides" : "straight leg collides";
           return result;
         }
@@ -428,6 +442,56 @@ SmoothingResult smooth(
   }
   result.failure = "no timing within the limits";
   return result;
+}
+
+std::shared_ptr<const WaypointTrajectory> brake(
+  const Eigen::Vector3d & position, const StartState & start, const SmoothingParams & params)
+{
+  WaypointTrajectory::Knot from;
+  from.position = position;
+  from.velocity = start.velocity;
+  from.acceleration = start.acceleration;
+  WaypointTrajectory::Knot stop;
+  stop.position = position;
+  double T = 0.1;
+  if (!start.velocity.isZero()) {
+    stop = braking_stop(from, params, &T);
+  } else if (!start.acceleration.isZero()) {
+    // At rest but accelerating: settle in place.
+    T = std::sqrt(start.acceleration.norm() / params.max_acc) * 3.0 + 0.1;
+  }
+  const double yaw = start.yaw.value_or(0.0);
+  std::vector<WaypointTrajectory::Turn> turns;
+  if (start.yaw && start.yaw_rate != 0.0) {
+    turns.push_back({0.0, first_turn_duration(yaw, start.yaw_rate, yaw, params), yaw});
+  }
+  return std::make_shared<const WaypointTrajectory>(
+    std::vector<WaypointTrajectory::Knot>{from, stop}, std::vector<double>{T}, yaw, turns,
+    turns.empty() ? 0.0 : start.yaw_rate);
+}
+
+std::optional<double> first_collision(
+  const OccupancyMap & map, const trajectory_server::Trajectory & trajectory, double t0,
+  double radius, double dt)
+{
+  std::vector<std::pair<double, Eigen::Vector3d>> samples;
+  Eigen::AlignedBox3d box;
+  for (double t = std::max(t0, 0.0); ; t = std::min(t + dt, trajectory.duration())) {
+    const Eigen::Vector3d p = trajectory.sample(t).position;
+    samples.emplace_back(t, p);
+    box.extend(p);
+    if (t >= trajectory.duration()) {
+      break;
+    }
+  }
+  // Distances only around the trajectory: cheap enough to check every map update.
+  const DistanceMap distances(map, box, radius);
+  for (const auto & [t, p] : samples) {
+    if (distances.distance(distances.key(p)) <= radius) {
+      return t;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace path_planner

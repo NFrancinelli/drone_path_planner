@@ -109,7 +109,7 @@ DistanceMap::DistanceMap(
   const double res = map.resolution();
   distance_.resize(total);
   for (long j = 0; j < total; ++j) {
-    distance_[j] = static_cast<float>(std::sqrt(sq[j]) * res);
+    distance_[j] = std::sqrt(sq[j]) * res;
   }
 }
 

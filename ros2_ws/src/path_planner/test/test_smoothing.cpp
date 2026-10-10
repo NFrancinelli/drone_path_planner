@@ -282,6 +282,49 @@ TEST(Smooth, BrakesBeforeReversingOntoALongLeg)
   EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
 }
 
+TEST(Brake, StopsStraightAheadWithinLimits)
+{
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0.8, 0.2, 0};
+  start.acceleration = {0.2, 0, 0};
+  start.yaw = 0.3;
+  start.yaw_rate = 0.4;
+  const Eigen::Vector3d from(1, 1, 2);
+  const auto traj = path_planner::brake(from, start, params);
+  ASSERT_TRUE(traj);
+  const auto p0 = traj->sample(0.0);
+  EXPECT_LT((p0.velocity - start.velocity).norm(), 1e-12);
+  EXPECT_LT((p0.acceleration - start.acceleration).norm(), 1e-12);
+  EXPECT_NEAR(p0.yaw_rate, 0.4, 1e-12);
+  const auto end = traj->sample(traj->duration());
+  EXPECT_LT(end.velocity.norm(), 1e-12);
+  EXPECT_NEAR(end.yaw_rate, 0.0, 1e-12);
+  // Ahead, along the velocity, within a couple of braking distances.
+  const Eigen::Vector3d travel = end.position - from;
+  EXPECT_GT(travel.dot(start.velocity.normalized()), 0.0);
+  EXPECT_LT(travel.norm(), 2.0 * start.velocity.squaredNorm() / params.max_acc + 0.3);
+  expect_within_limits(*traj, params);
+}
+
+TEST(FirstCollision, FindsWhereATrajectoryRunsIntoTheMap)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({3.1, -2.0, 0.0}, {3.1, 2.0, 4.0}, Occupancy::Occupied);  // wall x = 3..3.25
+  const trajectory_server::QuinticLine line({0, 0, 2.125}, {6, 0, 2.125}, 0.0, 12.0);
+
+  const auto t = path_planner::first_collision(map, line, 0.0, 0.4);
+  ASSERT_TRUE(t);
+  // First within 0.4 m of the wall's voxel centers (x = 3.125).
+  const double x = line.sample(*t).position.x();
+  EXPECT_GT(x, 3.125 - 0.4 - 0.25);
+  EXPECT_LT(x, 3.125 - 0.4 + 0.05);
+  // Nothing past the wall, nor on a path well clear of it.
+  EXPECT_FALSE(path_planner::first_collision(map, line, 9.0, 0.4));
+  const trajectory_server::QuinticLine clear({0, 3, 2.125}, {6, 3, 2.125}, 0.0, 12.0);
+  EXPECT_FALSE(path_planner::first_collision(map, clear, 0.0, 0.4));
+}
+
 TEST(Smooth, RejectsDegeneratePath)
 {
   const TestMap map(Occupancy::Free);

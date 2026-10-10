@@ -2,10 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <queue>
 #include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 
@@ -114,23 +114,29 @@ AStarPlanner::Result AStarPlanner::plan(
       return (d.cast<double>().norm() + p_.vertical_cost * std::abs(d.z())) * res;
     };
 
+  // Search state in flat arrays over the distance map's grid (which covers the bounds):
+  // much faster than hash maps, and the grid is allocated per plan anyway.
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  std::vector<double> g(map.cells(), kInf);
+  std::vector<int8_t> parent(map.cells(), -1);  // index into kNeighbours of the step in
+  std::vector<uint8_t> closed(map.cells(), 0);
   std::priority_queue<OpenEntry, std::vector<OpenEntry>, OpenCompare> open;
-  std::unordered_map<Key, double, KeyHash> g{{start_key, 0.0}};
-  std::unordered_map<Key, Key, KeyHash> parent;
-  std::unordered_set<Key, KeyHash> closed;
+  g[map.index(start_key)] = 0.0;
   open.push({heuristic(start_key), 0.0, start_key});
 
   while (!open.empty()) {
     const OpenEntry node = open.top();
     open.pop();
-    if (!closed.insert(node.key).second) {
+    const long i = map.index(node.key);
+    if (closed[i]) {
       continue;  // stale entry
     }
+    closed[i] = 1;
 
     if (node.key == goal_key) {
       std::vector<Key> keys{goal_key};
       while (keys.back() != start_key) {
-        keys.push_back(parent.at(keys.back()));
+        keys.push_back(keys.back() - kNeighbours[parent[map.index(keys.back())]].offset);
       }
       std::reverse(keys.begin(), keys.end());
       result.path.push_back(start);
@@ -148,19 +154,23 @@ AStarPlanner::Result AStarPlanner::plan(
       return result;
     }
 
-    for (const Step & step : kNeighbours) {
+    for (size_t s = 0; s < kNeighbours.size(); ++s) {
+      const Step & step = kNeighbours[s];
       const Key next = node.key + step.offset;
-      if (closed.count(next) || !in_bounds(next) || blocked(next)) {
+      if (!in_bounds(next)) {
+        continue;  // also keeps index() inside the grid, which covers the bounds
+      }
+      const long j = map.index(next);
+      if (closed[j] || blocked(next)) {
         continue;
       }
       const double weight = step_weight(p_, map, next);
       const double cost = node.g + (step.length * weight + p_.vertical_cost * step.climb) * res;
-      auto [it, inserted] = g.try_emplace(next, cost);
-      if (!inserted && cost >= it->second) {
+      if (cost >= g[j]) {
         continue;
       }
-      it->second = cost;
-      parent[next] = node.key;
+      g[j] = cost;
+      parent[j] = static_cast<int8_t>(s);
       open.push({cost + heuristic(next), cost, next});
     }
   }
