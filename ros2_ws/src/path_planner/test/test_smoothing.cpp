@@ -71,6 +71,13 @@ void expect_within_limits(const trajectory_server::Trajectory & traj, const Smoo
   }
 }
 
+// Knots where the drone is at rest (start, stops, end; not the moving ones on legs).
+size_t rest_knots(const trajectory_server::WaypointTrajectory & traj)
+{
+  return std::count_if(traj.knots().begin(), traj.knots().end(),
+           [](const auto & k) {return k.velocity.norm() < 1e-12;});
+}
+
 // Largest distance from the trajectory to the polyline through `path`.
 double max_deviation(const trajectory_server::Trajectory & traj, const Path & path)
 {
@@ -180,7 +187,7 @@ TEST(Smooth, StopsAtCornerWhenTheCurveWouldHitAnObstacle)
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   EXPECT_EQ(result.stopped_knots, 1);
-  EXPECT_EQ(traj.knots().size(), 3u);  // start, stopped corner, goal
+  EXPECT_EQ(rest_knots(traj), 3u);  // start, stopped corner, goal
   EXPECT_LT(traj.sample(traj.knot_time(knot_at(traj, kCorner[1]))).velocity.norm(), 1e-9);
   const auto dist = distances(map);
   for (double t = 0.0; t <= traj.duration(); t += 0.02) {
@@ -276,8 +283,8 @@ TEST(Smooth, BrakesBeforeReversingOntoALongLeg)
   const auto result = smooth(distances(map), path, params, start);
   ASSERT_TRUE(result.trajectory) << result.failure;
   const auto & traj = *result.trajectory;
-  EXPECT_EQ(traj.knots().size(), 3u);  // start, stop, goal
-  EXPECT_LT(traj.knots()[1].velocity.norm(), 1e-12);
+  EXPECT_EQ(rest_knots(traj), 2u);  // stop, goal
+  EXPECT_LT(traj.knots()[1].velocity.norm(), 1e-12);  // the stop comes first
   expect_within_limits(traj, params);
   EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
 }
@@ -323,6 +330,29 @@ TEST(FirstCollision, FindsWhereATrajectoryRunsIntoTheMap)
   EXPECT_FALSE(path_planner::first_collision(map, line, 9.0, 0.4));
   const trajectory_server::QuinticLine clear({0, 3, 2.125}, {6, 3, 2.125}, 0.0, 12.0);
   EXPECT_FALSE(path_planner::first_collision(map, clear, 0.0, 0.4));
+}
+
+TEST(Smooth, CruisesAtMaxSpeedOnLongLegs)
+{
+  // A 10 m leg ramps up, cruises at (nearly) max_vel, ramps down: ~12 s instead of the
+  // ~19 s one quintic takes, which averages about half its peak speed.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 0, 2}, {10, 0, 2}};
+  const SmoothingParams params;
+  const auto result = smooth(distances(map), path, params);
+  ASSERT_TRUE(result.trajectory) << result.failure;
+  const auto & traj = *result.trajectory;
+  EXPECT_EQ(traj.knots().size(), 4u);
+  EXPECT_NEAR(traj.sample(traj.duration() / 2).velocity.x(), 0.99 * params.max_vel, 1e-9);
+  const double ramp = 1.875 * std::pow(0.99, 2) / (2 * 0.99 * params.max_acc);
+  EXPECT_NEAR(traj.duration(), 2 * (2 * ramp / 0.99) + (10 - 2 * ramp) / 0.99, 1e-9);
+  expect_within_limits(traj, params);
+  // Still a straight line, never backwards.
+  for (double t = 0.0; t <= traj.duration(); t += 0.01) {
+    const auto p = traj.sample(t);
+    EXPECT_LT(std::abs(p.position.y()) + std::abs(p.position.z() - 2), 1e-9) << "t = " << t;
+    EXPECT_GE(p.velocity.x(), -1e-9) << "t = " << t;
+  }
 }
 
 TEST(Smooth, RejectsDegeneratePath)

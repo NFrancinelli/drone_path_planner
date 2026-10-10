@@ -124,6 +124,69 @@ WaypointTrajectory::Knot braking_stop(
   }
 }
 
+// Long straight legs ramp up to cruise speed, cruise, and ramp down, instead of being one
+// quintic (which averages only about half its peak speed). A straight leg is a segment
+// whose end velocities point along it, without acceleration. It gets two extra knots a ramp
+// distance in from each end, moving at cruise speed: the ramps are quintics from one speed
+// to the other along the leg, v = v0 + (v1 - v0) s(t / T) with s the minimum-jerk profile,
+// whose peak acceleration 1.875 (v1 - v0) / T fixes the ramp length; between the two knots
+// the quintic is exactly constant speed. Inserts the knots (owner -1) and shifts
+// corner_knot; returns each segment's exact duration, or 0 where it's left to search.
+std::vector<double> add_cruise(
+  std::vector<WaypointTrajectory::Knot> & knots, std::vector<int> & owner,
+  std::vector<size_t> & corner_knot, const SmoothingParams & params)
+{
+  constexpr double kMargin = 0.99;  // as in segment_duration
+  const double vc = params.max_vel * kMargin, acc = params.max_acc * kMargin;
+  std::vector<WaypointTrajectory::Knot> out_knots;
+  std::vector<int> out_owner;
+  std::vector<size_t> remap(knots.size());
+  std::vector<double> exact;
+  for (size_t j = 0; j < knots.size(); ++j) {
+    remap[j] = out_knots.size();
+    out_knots.push_back(knots[j]);
+    out_owner.push_back(owner[j]);
+    if (j + 1 == knots.size()) {
+      break;
+    }
+    const auto & a = knots[j];
+    const auto & b = knots[j + 1];
+    const Eigen::Vector3d delta = b.position - a.position;
+    const double length = delta.norm();
+    const Eigen::Vector3d dir = delta / std::max(length, 1e-9);
+    const auto along = [&](const Eigen::Vector3d & v) {
+        return (v - v.dot(dir) * dir).norm() < 1e-6 && v.dot(dir) >= -1e-9;
+      };
+    const double va = a.velocity.dot(dir), vb = b.velocity.dot(dir);
+    const double ramp_a = 1.875 * (vc * vc - va * va) / (2.0 * acc);
+    const double ramp_b = 1.875 * (vc * vc - vb * vb) / (2.0 * acc);
+    const bool straight = length > 1e-6 && along(a.velocity) && along(b.velocity) &&
+      a.acceleration.isZero() && b.acceleration.isZero() && va < vc && vb < vc;
+    if (!straight || ramp_a + ramp_b + 0.1 > length) {
+      exact.push_back(0.0);
+      continue;
+    }
+    WaypointTrajectory::Knot in, out;
+    in.position = a.position + ramp_a * dir;
+    in.velocity = vc * dir;
+    out.position = b.position - ramp_b * dir;
+    out.velocity = vc * dir;
+    out_knots.push_back(in);
+    out_owner.push_back(-1);
+    out_knots.push_back(out);
+    out_owner.push_back(-1);
+    exact.push_back(2.0 * ramp_a / (va + vc));
+    exact.push_back((length - ramp_a - ramp_b) / vc);
+    exact.push_back(2.0 * ramp_b / (vb + vc));
+  }
+  for (auto & k : corner_knot) {
+    k = remap[k];
+  }
+  knots = std::move(out_knots);
+  owner = std::move(out_owner);
+  return exact;
+}
+
 // Shortest duration for a yaw turn from (from, rate) to `to` at rest, within the yaw rate
 // and acceleration limits. Same profile as WaypointTrajectory's first turn.
 double first_turn_duration(double from, double rate, double to, const SmoothingParams & params)
@@ -310,6 +373,8 @@ SmoothingResult smooth(
       }
     }
     add(pts.back(), Eigen::Vector3d::Zero(), -1);
+    // Segments whose duration is known exactly (cruise legs), by index.
+    std::vector<double> exact = add_cruise(knots, owner, corner_knot, params);
     const size_t m = knots.size();
 
     // Corners to slow down this iteration. A set, because a corner owns up to three knots
@@ -335,7 +400,8 @@ SmoothingResult smooth(
     std::vector<double> durations(m - 1);
     bool infeasible = false;
     for (size_t j = 0; j + 1 < m; ++j) {
-      durations[j] = segment_duration(knots[j], knots[j + 1], params, j == 0);
+      durations[j] = exact[j] > 0.0 ? exact[j] :
+        segment_duration(knots[j], knots[j + 1], params, j == 0);
       if (durations[j] == 0.0) {
         mark_slow(owner[j]);
         mark_slow(owner[j + 1]);

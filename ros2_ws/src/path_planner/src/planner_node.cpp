@@ -6,7 +6,11 @@
 //   - every improve_period, a new plan replaces it if it arrives clearly sooner
 //     (improve_min_gain seconds and improve_min_ratio of the remaining time);
 //   - if a blocked trajectory can't be replanned, the drone brakes to a stop, hovers, and
-//     plans again every improve_period as the map grows.
+//     plans again every improve_period as the map grows;
+//   - if the flown trajectory comes within emergency_radius of an obstacle sooner than a
+//     new plan could take over, the drone brakes at once.
+// Every voxel ever seen occupied stays an obstacle (StickyMap): the worlds are static, and
+// OctoMap can open holes in thin walls.
 //
 // While the drone is flying a trajectory (`active_trajectory`, from the server), a new plan
 // continues it: it starts replan_lead seconds ahead on that trajectory, in exactly its state
@@ -15,8 +19,13 @@
 //
 // Goals come from RViz's "2D Goal Pose" tool, which sends z = 0, so the goal altitude is a
 // parameter.
+//
+// RViz markers on `planner_markers`: the goal, the trajectory sent coloured by speed, and
+// for a few seconds after a replan, the blocked trajectory in red with where it hit.
 
+#include <algorithm>
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <memory>
 #include <optional>
@@ -34,10 +43,12 @@
 #include <tf2/exceptions.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "path_planner/astar.hpp"
 #include "path_planner/octomap_map.hpp"
 #include "path_planner/smoothing.hpp"
+#include "path_planner/sticky_map.hpp"
 #include "trajectory_server/msg_conversions.hpp"
 
 namespace path_planner
@@ -45,6 +56,44 @@ namespace path_planner
 
 using trajectory_server::WaypointTrajectory;
 using Ms = std::chrono::duration<double, std::milli>;
+
+// A trajectory sent to the server and the time it takes over.
+struct Segment
+{
+  std::shared_ptr<const WaypointTrajectory> trajectory;
+  rclcpp::Time start;
+};
+
+// What the drone flies, as one trajectory from `origin`: each segment from its start until
+// the next one takes over. Mirrors the server's queue of continuations.
+class Flown : public trajectory_server::Trajectory
+{
+public:
+  Flown(std::deque<Segment> segments, const rclcpp::Time & origin)
+  : segments_(std::move(segments)), origin_(origin) {}
+
+  double duration() const override
+  {
+    const auto & last = segments_.back();
+    return std::max((last.start - origin_).seconds() + last.trajectory->duration(), 0.0);
+  }
+
+  trajectory_server::TrajectoryPoint sample(double t) const override
+  {
+    const rclcpp::Time at = origin_ + rclcpp::Duration::from_seconds(t);
+    const Segment * s = &segments_.front();
+    for (const auto & segment : segments_) {
+      if (segment.start <= at) {
+        s = &segment;
+      }
+    }
+    return s->trajectory->sample((at - s->start).seconds());
+  }
+
+private:
+  std::deque<Segment> segments_;
+  rclcpp::Time origin_;
+};
 
 class PlannerNode : public rclcpp::Node
 {
@@ -58,6 +107,7 @@ public:
     replan_lead_ = declare_parameter("replan_lead", 1.0);
     const double check_period = declare_parameter("check_period", 0.2);
     const double improve_period = declare_parameter("improve_period", 2.0);
+    emergency_radius_ = declare_parameter("emergency_radius", 0.4);
     improve_min_gain_ = declare_parameter("improve_min_gain", 1.0);
     improve_min_ratio_ = declare_parameter("improve_min_ratio", 0.1);
 
@@ -95,6 +145,8 @@ public:
       "smoothed_path", rclcpp::QoS(1).transient_local());
     // Not latched: a trajectory server that starts later must not fly a stale plan.
     trajectory_pub_ = create_publisher<drone_interfaces::msg::WaypointTrajectory>("trajectory", 1);
+    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      "planner_markers", rclcpp::QoS(10).transient_local());
     // Only the latest map is kept; it's deserialized when needed.
     map_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
       "octomap_binary", 1,
@@ -102,11 +154,7 @@ public:
     // Latched by the server: the planner trajectory it's flying, stamped with its start.
     active_sub_ = create_subscription<drone_interfaces::msg::WaypointTrajectory>(
       "active_trajectory", rclcpp::QoS(1).transient_local(),
-      [this](drone_interfaces::msg::WaypointTrajectory::ConstSharedPtr msg) {
-        active_ = trajectory_server::from_msg(*msg);
-        active_start_ = rclcpp::Time(msg->header.stamp, get_clock()->get_clock_type());
-        awaiting_since_.reset();
-      });
+      [this](drone_interfaces::msg::WaypointTrajectory::ConstSharedPtr msg) {on_active(*msg);});
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "goal_pose", 10,
       [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {on_goal(*msg);});
@@ -140,30 +188,65 @@ private:
     }
     goal_ = Eigen::Vector3d(msg.pose.position.x, msg.pose.position.y, goal_altitude_);
     RCLCPP_INFO(get_logger(), "Goal (%.2f, %.2f, %.2f)", goal_->x(), goal_->y(), goal_->z());
+    publish_goal_marker();
     replan(Reason::NewGoal);
   }
 
   // --- drone state, as far as the planner knows ---------------------------------------
 
-  // Time into the active trajectory.
-  double active_time(const rclcpp::Time & t) const {return (t - active_start_).seconds();}
-
-  // Still flying the active trajectory at time t.
-  bool flying(const rclcpp::Time & t) const
+  // The server started a trajectory. Known if we sent it as a continuation (then the ones
+  // before it are done); otherwise one sent from rest, which replaces everything. Latched
+  // messages can arrive late: one older than what we know is stale.
+  void on_active(const drone_interfaces::msg::WaypointTrajectory & msg)
   {
-    return active_ && active_time(t) < active_->duration();
+    const rclcpp::Time start(msg.header.stamp, get_clock()->get_clock_type());
+    if (!flown_.empty() && start < flown_.front().start) {
+      return;
+    }
+    for (size_t i = 0; i < flown_.size(); ++i) {
+      if (flown_[i].start == start) {
+        flown_.erase(flown_.begin(), flown_.begin() + i);
+        return;
+      }
+    }
+    flown_ = {{trajectory_server::from_msg(msg), start}};
+    awaiting_since_.reset();
   }
 
-  // Something sent hasn't started yet: a trajectory from rest (the server turns first), or
-  // a continuation waiting to take over. Replanning meanwhile would race it: the server
-  // only takes a continuation that starts before the one waiting.
+  // Still flying at time t.
+  bool flying(const rclcpp::Time & t) const
+  {
+    if (flown_.empty()) {
+      return false;
+    }
+    const auto & last = flown_.back();
+    return (t - last.start).seconds() < last.trajectory->duration();
+  }
+
+  // State of the drone's trajectory at time t (while flying).
+  trajectory_server::TrajectoryPoint state_at(const rclcpp::Time & t) const
+  {
+    return Flown(flown_, t).sample(0.0);
+  }
+
+  static StartState start_state(const trajectory_server::TrajectoryPoint & s)
+  {
+    StartState state;
+    state.velocity = s.velocity;
+    state.acceleration = s.acceleration;
+    state.yaw = s.yaw;
+    state.yaw_rate = s.yaw_rate;
+    return state;
+  }
+
+  // A trajectory sent from rest that the server hasn't started yet (it turns first).
   bool awaiting_start()
   {
     if (awaiting_since_ && (now() - *awaiting_since_).seconds() > 15.0) {
       RCLCPP_WARN(get_logger(), "Trajectory server never started the last trajectory");
       awaiting_since_.reset();
     }
-    return awaiting_since_.has_value() || (active_ && active_start_ > now());
+    return awaiting_since_.has_value();
   }
 
   // --- timers -------------------------------------------------------------------------
@@ -175,9 +258,25 @@ private:
       return;
     }
     if (!flying(now())) {
-      if (active_ && (active_->sample(active_->duration()).position - *goal_).norm() < 0.05) {
+      // Flown all the way to the goal, and actually there (not stopped short after a crash
+      // or a brake): done. Otherwise the goal stays, and improve() tries again from here.
+      const auto & last = flown_.empty() ? nullptr : flown_.back().trajectory;
+      if (last && (last->sample(last->duration()).position - *goal_).norm() < 0.05) {
+        try {
+          const auto & t = tf_buffer_->lookupTransform(
+            world_frame_, body_frame_, tf2::TimePointZero).transform.translation;
+          const double off = (Eigen::Vector3d(t.x, t.y, t.z) - *goal_).norm();
+          if (off > kReachedTolerance) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+              "Trajectory to the goal flown, but the drone is %.2f m from it", off);
+            return;
+          }
+        } catch (const tf2::TransformException &) {
+          return;
+        }
         RCLCPP_INFO(get_logger(), "Goal reached");
         goal_.reset();
+        publish_goal_marker();
       }
       return;
     }
@@ -185,21 +284,34 @@ private:
     if (!tree) {
       return;
     }
-    const double t_now = active_time(now());
-    const auto hit = first_collision(
-      OctomapMap(tree), *active_, t_now, smoothing_.collision_radius);
+    const OctomapMap octomap(tree);
+    const StickyMap map(octomap, sticky_);
+    const Flown flown(flown_, now());
+
+    // Too close for a new plan to take over in time: brake now, no planning needed.
+    const auto danger = first_collision(map, flown, 0.0, emergency_radius_);
+    if (danger && *danger < replan_lead_) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Obstacle within emergency_radius %.1f s ahead; braking now", *danger);
+      publish_blocked_markers(flown, 0.0, *danger);
+      const rclcpp::Time at = now() + rclcpp::Duration::from_seconds(kBrakeLead);
+      const auto s = state_at(at);
+      send(brake(s.position, start_state(s), smoothing_), at, true);
+      return;
+    }
+    const auto hit = first_collision(map, flown, 0.0, smoothing_.collision_radius);
     if (!hit) {
       return;
     }
-    // A new plan only takes over replan_lead from now, so a hit before then can't be avoided
-    // by replanning; nor is it necessarily a crash: collision_radius has a margin over the
-    // drone, and squeezing through a gap can graze it as the map fills in.
-    if (*hit - t_now < replan_lead_) {
+    // Closer than collision_radius but not emergency_radius: a margin over the drone that
+    // squeezing through a gap can graze as the map fills in. Too soon to replan anyway.
+    if (*hit < replan_lead_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-        "Within collision_radius of an obstacle %.1f s ahead, too soon to replan", *hit - t_now);
+        "Within collision_radius of an obstacle %.1f s ahead, too soon to replan", *hit);
       return;
     }
-    RCLCPP_WARN(get_logger(), "Trajectory blocked %.1f s ahead, replanning", *hit - t_now);
+    RCLCPP_WARN(get_logger(), "Trajectory blocked %.1f s ahead, replanning", *hit);
+    publish_blocked_markers(flown, 0.0, *hit);
     replan(Reason::Blocked);
   }
 
@@ -235,7 +347,9 @@ private:
     const auto tree = std::dynamic_pointer_cast<octomap::OcTree>(abstract);
     if (!tree) {
       RCLCPP_ERROR(get_logger(), "Map message is not an OcTree");
+      return nullptr;
     }
+    OctomapMap(tree).collect_occupied(sticky_);
     return tree;
   }
 
@@ -253,16 +367,13 @@ private:
     // Continue the trajectory being flown if it's still going at the takeover time, else
     // start at rest from where the drone is.
     Eigen::Vector3d start;
-    StartState start_state;
+    StartState start_state;  // at rest
     const rclcpp::Time takeover = now() + rclcpp::Duration::from_seconds(replan_lead_);
     const bool continuing = flying(takeover);
     if (continuing) {
-      const auto s = active_->sample(active_time(takeover));
+      const auto s = state_at(takeover);
       start = s.position;
-      start_state.velocity = s.velocity;
-      start_state.acceleration = s.acceleration;
-      start_state.yaw = s.yaw;
-      start_state.yaw_rate = s.yaw_rate;
+      start_state = PlannerNode::start_state(s);
     } else {
       try {
         const auto tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
@@ -281,13 +392,8 @@ private:
         const rclcpp::Time brake_at = now() + rclcpp::Duration::from_seconds(replan_lead_);
         RCLCPP_WARN(get_logger(), "No way to the goal (%s); braking to a stop", name(reason));
         if (flying(brake_at)) {
-          const auto s = active_->sample(active_time(brake_at));
-          StartState state;
-          state.velocity = s.velocity;
-          state.acceleration = s.acceleration;
-          state.yaw = s.yaw;
-          state.yaw_rate = s.yaw_rate;
-          send(brake(s.position, state, smoothing_), brake_at, true);
+          const auto s = state_at(brake_at);
+          send(brake(s.position, PlannerNode::start_state(s), smoothing_), brake_at, true);
         }
       } else if (verbose) {
         RCLCPP_WARN(get_logger(), "No way to the goal yet; hovering, will retry");
@@ -299,7 +405,7 @@ private:
     }
 
     if (reason == Reason::Improve) {
-      const double remaining = active_->duration() - active_time(takeover);
+      const double remaining = Flown(flown_, takeover).duration();
       const double gain = remaining - planned.trajectory->duration();
       if (gain < improve_min_gain_ || gain < improve_min_ratio_ * remaining) {
         return;
@@ -326,8 +432,9 @@ private:
     Planned out;
     // One distance map for the search, shortcut and smoothing.
     const OctomapMap octomap(std::move(tree));
+    const StickyMap sticky(octomap, sticky_);
     const auto t_map = std::chrono::steady_clock::now();
-    const DistanceMap map(octomap, planner_->params().bounds, planner_->max_distance());
+    const DistanceMap map(sticky, planner_->params().bounds, planner_->max_distance());
     const auto t0 = std::chrono::steady_clock::now();
     const auto result = planner_->plan(map, start, *goal_);
     const auto t1 = std::chrono::steady_clock::now();
@@ -385,22 +492,30 @@ private:
         return;
       }
       RCLCPP_INFO(get_logger(), "Continuing the current trajectory, takeover in %.2f s", margin);
-      active_ = trajectory;
-      active_start_ = start_time;
+      // As the server does: drop what would start at or after it, and what's done.
+      while (!flown_.empty() && flown_.back().start >= start_time) {
+        flown_.pop_back();
+      }
+      flown_.push_back({trajectory, start_time});
+      while (flown_.size() > 1 && flown_[1].start <= now()) {
+        flown_.pop_front();
+      }
     } else {
       awaiting_since_ = now();
     }
     std::vector<Eigen::Vector3d> points;
-    std::vector<double> yaws;
+    std::vector<double> yaws, speeds;
     for (double t = 0.0; ; t = std::min(t + 0.1, trajectory->duration())) {
       const auto sp = trajectory->sample(t);
       points.push_back(sp.position);
       yaws.push_back(sp.yaw);
+      speeds.push_back(sp.velocity.norm());
       if (t >= trajectory->duration()) {
         break;
       }
     }
     publish_path(*smoothed_pub_, points, yaws);
+    publish_trajectory_marker(points, speeds);
 
     auto msg = trajectory_server::to_msg(*trajectory);
     msg.header.stamp = start_time;
@@ -409,6 +524,98 @@ private:
   }
 
   // --- RViz ---------------------------------------------------------------------------
+
+  visualization_msgs::msg::Marker marker(const std::string & ns, int type) const
+  {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = world_frame_;
+    m.header.stamp = now();
+    m.ns = ns;
+    m.type = type;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.orientation.w = 1.0;
+    return m;
+  }
+
+  static geometry_msgs::msg::Point point(const Eigen::Vector3d & p)
+  {
+    geometry_msgs::msg::Point out;
+    out.x = p.x();
+    out.y = p.y();
+    out.z = p.z();
+    return out;
+  }
+
+  static std_msgs::msg::ColorRGBA color(double r, double g, double b, double a = 1.0)
+  {
+    std_msgs::msg::ColorRGBA c;
+    c.r = static_cast<float>(r);
+    c.g = static_cast<float>(g);
+    c.b = static_cast<float>(b);
+    c.a = static_cast<float>(a);
+    return c;
+  }
+
+  // Green sphere on the goal, removed once it's reached.
+  void publish_goal_marker()
+  {
+    auto m = marker("goal", visualization_msgs::msg::Marker::SPHERE);
+    if (goal_) {
+      m.pose.position = point(*goal_);
+      m.scale.x = m.scale.y = m.scale.z = 0.4;
+      m.color = color(0.1, 0.9, 0.2, 0.8);
+    } else {
+      m.action = visualization_msgs::msg::Marker::DELETE;
+    }
+    visualization_msgs::msg::MarkerArray array;
+    array.markers.push_back(m);
+    marker_pub_->publish(array);
+  }
+
+  // The trajectory sent, coloured by speed: blue at rest to orange at max_vel.
+  void publish_trajectory_marker(
+    const std::vector<Eigen::Vector3d> & points, const std::vector<double> & speeds)
+  {
+    auto m = marker("trajectory", visualization_msgs::msg::Marker::LINE_STRIP);
+    m.scale.x = 0.06;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const double s = std::clamp(speeds[i] / smoothing_.max_vel, 0.0, 1.0);
+      m.points.push_back(point(points[i]));
+      m.colors.push_back(color(0.1 + 0.9 * s, 0.4 + 0.1 * s, 1.0 - s));
+    }
+    visualization_msgs::msg::MarkerArray array;
+    array.markers.push_back(m);
+    marker_pub_->publish(array);
+  }
+
+  // For a few seconds after a replan: the rest of the blocked trajectory in red, and a red
+  // sphere where it came too close to the map.
+  void publish_blocked_markers(
+    const trajectory_server::Trajectory & trajectory, double from, double hit)
+  {
+    const auto lifetime = rclcpp::Duration::from_seconds(3.0);
+    auto line = marker("blocked", visualization_msgs::msg::Marker::LINE_STRIP);
+    line.id = 0;
+    line.scale.x = 0.05;
+    line.color = color(0.9, 0.1, 0.1, 0.8);
+    line.lifetime = lifetime;
+    for (double t = from; ; t = std::min(t + 0.1, trajectory.duration())) {
+      line.points.push_back(point(trajectory.sample(t).position));
+      if (t >= trajectory.duration()) {
+        break;
+      }
+    }
+    auto sphere = marker("blocked", visualization_msgs::msg::Marker::SPHERE);
+    sphere.id = 1;
+    sphere.pose.position = point(trajectory.sample(hit).position);
+    sphere.scale.x = sphere.scale.y = sphere.scale.z = 2.0 * smoothing_.collision_radius;
+    sphere.color = color(0.9, 0.1, 0.1, 0.5);
+    sphere.lifetime = lifetime;
+    visualization_msgs::msg::MarkerArray array;
+    array.markers.push_back(line);
+    array.markers.push_back(sphere);
+    marker_pub_->publish(array);
+  }
 
   void clear_paths()
   {
@@ -439,14 +646,19 @@ private:
   }
 
   std::string world_frame_, body_frame_;
-  double goal_altitude_, replan_lead_, improve_min_gain_, improve_min_ratio_;
+  // How soon an emergency brake takes over: enough for the message to reach the server.
+  static constexpr double kBrakeLead = 0.15;  // [s]
+  // How close to the goal the drone must end up for it to count as reached.
+  static constexpr double kReachedTolerance = 0.5;  // [m]
+
+  double goal_altitude_, replan_lead_, improve_min_gain_, improve_min_ratio_, emergency_radius_;
   std::unique_ptr<AStarPlanner> planner_;
   SmoothingParams smoothing_;
 
   std::optional<Eigen::Vector3d> goal_;  // until a trajectory to it has been flown
   octomap_msgs::msg::Octomap::ConstSharedPtr map_msg_;
-  std::shared_ptr<const WaypointTrajectory> active_;  // being flown, or about to take over
-  rclcpp::Time active_start_;
+  std::deque<Segment> flown_;  // being flown, then continuations waiting to take over
+  KeySet sticky_;  // every voxel ever seen occupied
   std::optional<rclcpp::Time> awaiting_since_;  // sent from rest, not started yet
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -456,6 +668,7 @@ private:
   rclcpp::Subscription<drone_interfaces::msg::WaypointTrajectory>::SharedPtr active_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, smoothed_pub_;
   rclcpp::Publisher<drone_interfaces::msg::WaypointTrajectory>::SharedPtr trajectory_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   rclcpp::TimerBase::SharedPtr check_timer_, improve_timer_;
 };
 

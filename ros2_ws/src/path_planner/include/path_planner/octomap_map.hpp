@@ -68,6 +68,29 @@ public:
     }
   }
 
+  // Adds every occupied voxel to `out` (all the voxels a coarse occupied leaf covers).
+  void collect_occupied(KeySet & out) const
+  {
+    const double res = resolution();
+    for (auto it = tree_->begin_leafs(), end = tree_->end_leafs(); it != end; ++it) {
+      if (!tree_->isNodeOccupied(*it)) {
+        continue;
+      }
+      const double half = it.getSize() / 2.0;
+      const octomap::point3d c = it.getCoordinate();
+      const Eigen::Vector3d corner(c.x() - half, c.y() - half, c.z() - half);
+      const Key a = key(corner + Eigen::Vector3d::Constant(res / 2.0));
+      const Key b = key(corner + Eigen::Vector3d::Constant(2.0 * half - res / 2.0));
+      for (int z = a.z(); z <= b.z(); ++z) {
+        for (int y = a.y(); y <= b.y(); ++y) {
+          for (int x = a.x(); x <= b.x(); ++x) {
+            out.insert(Key(x, y, z));
+          }
+        }
+      }
+    }
+  }
+
 private:
   static constexpr int kCenter = 32768;  // tree_max_val for a depth-16 tree
 

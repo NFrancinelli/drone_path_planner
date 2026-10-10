@@ -5,8 +5,9 @@
 // between them; or (figure_eight.enabled) fly a figure-eight and land.
 // While hovering, a trajectory must start at rest where the drone holds; the drone first
 // turns in place to face along it. While flying one, a new trajectory is a continuation:
-// it must start in the future, in exactly the state the current one will be in then, and
-// takes over at that moment. The planner trajectory being flown is published on
+// it must start in the future, in exactly the state of what will be flown then (the current
+// trajectory, or an earlier continuation still waiting), and takes over at that moment;
+// waiting continuations that would start at or after it are dropped. The planner trajectory being flown is published on
 // `active_trajectory`, stamped with its actual start time, for the planner to continue.
 //
 // Everything here is in the ROS world frame (odom, where the map lives). PX4's local frame
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -205,11 +207,13 @@ private:
         break;
 
       case State::Follow:
-        if (pending_ && now() >= pending_start_) {
-          follow(std::exchange(pending_, nullptr), pending_start_);
+        while (!queue_.empty() && now() >= queue_.front().start) {
+          follow(queue_.front().trajectory, queue_.front().start);
+          queue_.pop_front();
           RCLCPP_INFO(get_logger(), "Continuing on new trajectory: %.1f s",
             trajectory_->duration());
-        } else if (!pending_ && trajectory_finished()) {
+        }
+        if (queue_.empty() && trajectory_finished()) {
           transition(State::Hover);
         }
         break;
@@ -361,9 +365,9 @@ private:
     turn_then_follow(trajectory, start.yaw, stamp);
   }
 
-  // Take over from the current trajectory at `start`, where the new one must pick up its
-  // state exactly. One continuation waits at a time: a new one replaces it only if it takes
-  // over earlier, since the waiting one would otherwise have to fly in between.
+  // Take over at `start` from what will be flown then (the current trajectory, or the last
+  // continuation queued to start by then), whose state there the new one must pick up
+  // exactly. Queued continuations starting at or after it are dropped.
   void continue_with(TrajectoryPtr trajectory, const rclcpp::Time & start)
   {
     const double lead = (start - now()).seconds();
@@ -371,11 +375,15 @@ private:
       RCLCPP_WARN(get_logger(), "Continuation arrived %.3f s after its start time; ignored", -lead);
       return;
     }
-    if (pending_ && start >= pending_start_) {
-      RCLCPP_WARN(get_logger(), "Continuation starts after the one already waiting; ignored");
-      return;
+    const Trajectory * base = trajectory_.get();
+    rclcpp::Time base_start = trajectory_start_;
+    for (const auto & queued : queue_) {
+      if (queued.start < start) {
+        base = queued.trajectory.get();
+        base_start = queued.start;
+      }
     }
-    const TrajectoryPoint from = trajectory_->sample((start - trajectory_start_).seconds());
+    const TrajectoryPoint from = base->sample((start - base_start).seconds());
     const TrajectoryPoint to = trajectory->sample(0.0);
     const double dp = (to.position - from.position).norm();
     const double dv = (to.velocity - from.velocity).norm();
@@ -387,8 +395,10 @@ private:
         "(%.3f m, %.3f m/s, %.3f m/s^2, %.3f rad, %.3f rad/s); ignored", dp, dv, da, dyaw, drate);
       return;
     }
-    pending_ = std::move(trajectory);
-    pending_start_ = start;
+    while (!queue_.empty() && queue_.back().start >= start) {
+      queue_.pop_back();
+    }
+    queue_.push_back({std::move(trajectory), start});
     RCLCPP_INFO(get_logger(), "Continuation accepted, takes over in %.2f s", lead);
   }
 
@@ -551,8 +561,14 @@ private:
   double last_command_time_{-std::numeric_limits<double>::infinity()};
   TrajectoryPtr trajectory_;
   rclcpp::Time trajectory_start_{now()};
-  TrajectoryPtr pending_;  // flown after the turn (Turn), or a continuation (Follow)
+  TrajectoryPtr pending_;  // flown after the turn (Turn)
   rclcpp::Time pending_start_{now()};
+  struct Queued
+  {
+    TrajectoryPtr trajectory;
+    rclcpp::Time start;
+  };
+  std::deque<Queued> queue_;  // continuations waiting to take over (Follow), by start
   TrajectoryPoint hold_point_;
 
   rclcpp::Subscription<VehicleStatus>::SharedPtr status_sub_;

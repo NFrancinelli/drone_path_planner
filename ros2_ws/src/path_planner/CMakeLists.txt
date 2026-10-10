@@ -16,6 +16,7 @@ find_package(Eigen3 REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(octomap REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -33,7 +34,7 @@ add_executable(planner_node src/planner_node.cpp)
 target_include_directories(planner_node PRIVATE ${OCTOMAP_INCLUDE_DIRS})
 target_link_libraries(planner_node planner_core ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(planner_node
-  rclcpp geometry_msgs nav_msgs octomap_msgs tf2_ros drone_interfaces)
+  rclcpp geometry_msgs nav_msgs octomap_msgs tf2_ros drone_interfaces visualization_msgs)
 
 install(TARGETS planner_node DESTINATION lib/${PROJECT_NAME})
 

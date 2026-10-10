@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <unordered_set>
 #include <vector>
 
 #include <Eigen/Core>
@@ -24,6 +25,8 @@ struct KeyHash
            (static_cast<std::size_t>(k.z()) * 83492791u);
   }
 };
+
+using KeySet = std::unordered_set<Key, KeyHash>;
 
 // Map interface the planner searches on (sparse grid in tests, OctoMap later).
 class OccupancyMap
