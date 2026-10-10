@@ -77,16 +77,10 @@ DistanceMap::DistanceMap(
   size_ = map.key(region.max() + margin) - lo_ + Key::Ones();
   const long total = long(size_.x()) * size_.y() * size_.z();
 
-  occupancy_.resize(total);
+  map.fill(lo_, size_, occupancy_);
   std::vector<double> sq(total);
-  long i = 0;
-  for (int z = 0; z < size_.z(); ++z) {
-    for (int y = 0; y < size_.y(); ++y) {
-      for (int x = 0; x < size_.x(); ++x, ++i) {
-        occupancy_[i] = map.at(lo_ + Key(x, y, z));
-        sq[i] = occupancy_[i] == Occupancy::Occupied ? 0.0 : kInf;
-      }
-    }
+  for (long i = 0; i < total; ++i) {
+    sq[i] = occupancy_[i] == Occupancy::Occupied ? 0.0 : kInf;
   }
 
   // Separable: transform every line along x, then y, then z.

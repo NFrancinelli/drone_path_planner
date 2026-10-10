@@ -14,7 +14,7 @@ Project page: https://nfrancinelli.github.io/projects/3d-planner/
   - [x] A* on the live OctoMap, obstacle inflation, cost for unknown space
   - [x] Path shortcutting and smooth trajectory, collision-checked against the map
   - [x] Trajectory server flies the planned trajectory
-- [ ] Milestone 4 – replanning in the factory world
+- [x] Milestone 4 – replanning in the factory world
   - [x] `factory` world: 1.5 m gaps, a corridor dead-ending at a crate wall
   - [x] New plans take over a trajectory in flight without a jump
   - [x] Replanning when the path gets blocked, switching to clearly shorter ways, braking when stuck
@@ -74,8 +74,8 @@ A new plan, like a goal clicked mid-flight, continues the current trajectory: it
 `replan_lead` (1 s) ahead on it, in exactly its position, velocity, acceleration and heading
 there, and the server switches over at that moment, braking first if the new path heads
 back. In the `factory` world, flying from the start to (19.5, 0) behind the crate wall
-takes about a dozen replans as the hall comes into view; the drone discovers the dead end,
-climbs over the crates and lands within 10 cm of the goal. Main `path_planner` parameters:
+takes about ten replans as the hall comes into view; the drone discovers the dead end,
+climbs over the crates and stops within 15 cm of the goal, in about 40 s. Main `path_planner` parameters:
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -144,7 +144,7 @@ server are stamped with system time.
 - Each straight leg of a smoothed trajectory is a single quintic, so its average speed is
   about half of `max_vel`.
 - Planning takes up to ~0.55 s while most of the hall is unknown (distance map over the
-  whole planning volume ~130 ms, A* up to ~400 ms), within the 1 s `replan_lead`.
+  whole planning volume ~70 ms, A* up to ~500 ms), within the 1 s `replan_lead`.
 - Clearances are measured between voxel centers, which can be half a voxel (0.1 m) closer
   to the real surface: `inflation_radius` (0.5 m) guarantees only ~0.4 m, barely more than
   the drone's 0.39 m radius. The clearance cost keeps paths centred (~0.35 m of margin each

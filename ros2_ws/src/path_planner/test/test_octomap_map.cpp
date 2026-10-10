@@ -1,5 +1,6 @@
 #include <cmath>
 #include <memory>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <octomap/OcTree.h>
@@ -84,4 +85,43 @@ TEST(OctomapMap, PlansAroundOctreeObstacle)
     }
   }
   EXPECT_TRUE(through_gap);
+}
+
+TEST(OctomapMap, FillMatchesPerVoxelLookups)
+{
+  // Pruned free blocks, scattered occupied voxels, unknown around them, negative keys, and a
+  // box that cuts through coarse leaves.
+  auto tree = std::make_shared<octomap::OcTree>(0.2);
+  for (double x = -1.5; x < 1.7; x += 0.2) {
+    for (double y = -1.5; y < 1.7; y += 0.2) {
+      for (double z = 0.1; z < 1.7; z += 0.2) {
+        tree->updateNode(octomap::point3d(x, y, z), false);
+      }
+    }
+  }
+  for (const auto & p : {octomap::point3d(0.3, 0.5, 0.7), octomap::point3d(-1.1, 0.1, 1.3),
+      octomap::point3d(2.5, -0.3, 0.9)})
+  {
+    tree->updateNode(p, true);
+  }
+  tree->updateInnerOccupancy();
+  tree->prune();
+  const path_planner::OctomapMap map(tree);
+
+  const path_planner::Key lo = map.key({-1.3, -0.9, -0.3});
+  const path_planner::Key size(22, 17, 12);
+  std::vector<path_planner::Occupancy> filled;
+  map.fill(lo, size, filled);
+  ASSERT_EQ(filled.size(), 22u * 17u * 12u);
+  size_t i = 0, occupied = 0;
+  for (int z = 0; z < size.z(); ++z) {
+    for (int y = 0; y < size.y(); ++y) {
+      for (int x = 0; x < size.x(); ++x, ++i) {
+        const path_planner::Key k = lo + path_planner::Key(x, y, z);
+        EXPECT_EQ(filled[i], map.at(k)) << k.transpose();
+        occupied += filled[i] == path_planner::Occupancy::Occupied;
+      }
+    }
+  }
+  EXPECT_EQ(occupied, 3u);
 }

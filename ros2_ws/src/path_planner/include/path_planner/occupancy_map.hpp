@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -31,6 +32,21 @@ public:
   virtual ~OccupancyMap() = default;
   virtual double resolution() const = 0;
   virtual Occupancy at(const Key & key) const = 0;
+
+  // Occupancy of every voxel in the box of keys [lo, lo + size), x fastest, then y, then z.
+  // By default at() per voxel; maps that can do better override it.
+  virtual void fill(const Key & lo, const Key & size, std::vector<Occupancy> & out) const
+  {
+    out.resize(static_cast<std::size_t>(size.x()) * size.y() * size.z());
+    std::size_t i = 0;
+    for (int z = 0; z < size.z(); ++z) {
+      for (int y = 0; y < size.y(); ++y) {
+        for (int x = 0; x < size.x(); ++x) {
+          out[i++] = at(lo + Key(x, y, z));
+        }
+      }
+    }
+  }
 
   Key key(const Eigen::Vector3d & p) const
   {
