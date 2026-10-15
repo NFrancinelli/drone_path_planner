@@ -19,7 +19,8 @@ struct TrajectoryPoint
 };
 
 // Trajectory parameterised by time, starting at t = 0. sample() clamps t to [0, duration()]
-// and both endpoints are at rest, so sampling past the end just hovers at the last point.
+// and the end is at rest, so sampling past the end just hovers at the last point. The start
+// is at rest too, except for a WaypointTrajectory continuing another one in flight.
 class Trajectory
 {
 public:
@@ -127,9 +128,11 @@ private:
 
 // Piecewise quintic through knots. Each segment is the quintic Hermite interpolant of
 // position, velocity and acceleration at its two knots, so the trajectory is C2 and passes
-// exactly through every knot. First and last knots must be at rest.
+// exactly through every knot. The last knot must be at rest; the first may be moving, so a
+// new trajectory can take over from another one in flight without a jump.
 // Yaw has its own timeline, independent of the knots: it starts at initial_yaw and changes
-// only during the given turns, each a rest-to-rest quintic taking the short way round.
+// only during the given turns, each a quintic taking the short way round, rest to rest
+// except that the first one may start at initial_yaw_rate (it must then start at t = 0).
 // If the last turn ends after the last knot, the drone holds position until it's done.
 class WaypointTrajectory : public Trajectory
 {
@@ -151,7 +154,7 @@ public:
   // durations[k] is the time from knot k to knot k + 1. Turns sorted and not overlapping.
   WaypointTrajectory(
     std::vector<Knot> knots, std::vector<double> durations, double initial_yaw,
-    std::vector<Turn> turns = {});
+    std::vector<Turn> turns = {}, double initial_yaw_rate = 0.0);
 
   double duration() const override {return duration_;}
   TrajectoryPoint sample(double t) const override;
@@ -163,12 +166,14 @@ public:
   // Time from knot k to knot k + 1.
   double segment_duration(size_t k) const {return segments_.at(k).duration();}
   double initial_yaw() const {return initial_yaw_;}
+  double initial_yaw_rate() const {return initial_yaw_rate_;}
 
 private:
   std::vector<Knot> knots_;
   std::vector<double> times_;  // cumulative, times_[0] = 0
   std::vector<QuinticHermite> segments_;
   double initial_yaw_;
+  double initial_yaw_rate_;
   std::vector<Turn> turns_;
   double duration_;
 };

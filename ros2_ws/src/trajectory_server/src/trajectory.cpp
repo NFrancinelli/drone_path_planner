@@ -190,16 +190,18 @@ Eigen::Vector3d QuinticHermite::acceleration(double u) const
 
 WaypointTrajectory::WaypointTrajectory(
   std::vector<Knot> knots, std::vector<double> durations, double initial_yaw,
-  std::vector<Turn> turns)
-: knots_(std::move(knots)), times_{0.0}, initial_yaw_(initial_yaw), turns_(std::move(turns))
+  std::vector<Turn> turns, double initial_yaw_rate)
+: knots_(std::move(knots)), times_{0.0}, initial_yaw_(initial_yaw),
+  initial_yaw_rate_(initial_yaw_rate), turns_(std::move(turns))
 {
   if (knots_.size() < 2 || durations.size() != knots_.size() - 1) {
     throw std::invalid_argument("WaypointTrajectory needs n >= 2 knots and n - 1 durations");
   }
-  for (const Knot * k : {&knots_.front(), &knots_.back()}) {
-    if (!k->velocity.isZero() || !k->acceleration.isZero()) {
-      throw std::invalid_argument("WaypointTrajectory must start and end at rest");
-    }
+  if (!knots_.back().velocity.isZero() || !knots_.back().acceleration.isZero()) {
+    throw std::invalid_argument("WaypointTrajectory must end at rest");
+  }
+  if (initial_yaw_rate_ != 0.0 && (turns_.empty() || turns_.front().start != 0.0)) {
+    throw std::invalid_argument("WaypointTrajectory initial_yaw_rate needs a first turn at t = 0");
   }
   for (size_t i = 0; i < durations.size(); ++i) {
     const double T = durations[i];
@@ -246,10 +248,21 @@ TrajectoryPoint WaypointTrajectory::sample(double t) const
     }
     const double delta = wrap_angle(turn.yaw - p.yaw);
     if (t < turn.start + turn.duration) {
+      const double T = turn.duration, tau = (t - turn.start) / T;
       double ys, dys, ddys;
-      quintic((t - turn.start) / turn.duration, ys, dys, ddys);
-      p.yaw_rate = delta * dys / turn.duration;
-      p.yaw = wrap_angle(p.yaw + delta * ys);
+      quintic(tau, ys, dys, ddys);
+      p.yaw_rate = delta * dys / T;
+      p.yaw = p.yaw + delta * ys;
+      if (&turn == &turns_.front() && initial_yaw_rate_ != 0.0) {
+        // Quintic Hermite basis for a start rate, with zero end rate and zero yaw
+        // acceleration at both ends: h(0) = h(1) = 0, h'(0) = 1, h'(1) = 0.
+        const double tau2 = tau * tau, tau3 = tau2 * tau;
+        const double h = tau - 6.0 * tau3 + 8.0 * tau3 * tau - 3.0 * tau3 * tau2;
+        const double dh = 1.0 - 18.0 * tau2 + 32.0 * tau3 - 15.0 * tau3 * tau;
+        p.yaw += initial_yaw_rate_ * T * h;
+        p.yaw_rate += initial_yaw_rate_ * dh;
+      }
+      p.yaw = wrap_angle(p.yaw);
       break;
     }
     p.yaw = wrap_angle(turn.yaw);

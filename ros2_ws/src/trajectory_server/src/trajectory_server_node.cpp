@@ -1,10 +1,14 @@
 // Streams trajectory setpoints to PX4 in offboard mode.
 //
 // Mission: wait for PX4, pre-stream setpoints, switch to offboard, arm, take off, then
-// either fly a figure-eight and land, or (figure_eight.enabled = false) hover and fly the
-// trajectories the planner sends on `trajectory`, holding position between them.
-// A trajectory is only accepted while hovering, and must start where the drone holds;
-// the drone first turns in place to face along it.
+// hover and fly the trajectories the planner sends on `trajectory`, holding position
+// between them; or (figure_eight.enabled) fly a figure-eight and land.
+// While hovering, a trajectory must start at rest where the drone holds; the drone first
+// turns in place to face along it. While flying one, a new trajectory is a continuation:
+// it must start in the future, in exactly the state of what will be flown then (the current
+// trajectory, or an earlier continuation still waiting), and takes over at that moment;
+// waiting continuations that would start at or after it are dropped. The planner trajectory being flown is published on
+// `active_trajectory`, stamped with its actual start time, for the planner to continue.
 //
 // Everything here is in the ROS world frame (odom, where the map lives). PX4's local frame
 // can be shifted from it: EKF2 puts its origin where its estimate started, e.g. its height
@@ -14,12 +18,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <drone_interfaces/msg/waypoint_trajectory.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -65,8 +71,8 @@ public:
     body_frame_ = declare_parameter("body_frame", std::string("base_link"));
     prestream_time_ = declare_parameter("prestream_time", 1.0);
     hover_time_ = declare_parameter("hover_time", 2.0);
-    // false: take off, hold position and fly the planner's trajectories.
-    fly_figure_eight_ = declare_parameter("figure_eight.enabled", true);
+    // true: fly a figure-eight and land instead of the planner's trajectories.
+    fly_figure_eight_ = declare_parameter("figure_eight.enabled", false);
     // Planner trajectories must start this close to the hold point [m].
     max_start_error_ = declare_parameter("max_start_error", 0.3);
     fig8_.half_length = declare_parameter("figure_eight.half_length", fig8_.half_length);
@@ -102,6 +108,8 @@ public:
     // Latched so RViz shows the active trajectory even if it subscribes later.
     path_pub_ = create_publisher<nav_msgs::msg::Path>(
       "planned_trajectory", rclcpp::QoS(1).transient_local());
+    active_pub_ = create_publisher<drone_interfaces::msg::WaypointTrajectory>(
+      "active_trajectory", rclcpp::QoS(1).transient_local());
 
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / rate_hz_), [this]() {tick();});
@@ -185,7 +193,7 @@ private:
 
       case State::Turn:
         if (trajectory_finished()) {
-          follow(pending_, std::max(now(), pending_start_));
+          follow(std::exchange(pending_, nullptr), std::max(now(), pending_start_));
           RCLCPP_INFO(get_logger(), "Flying trajectory: %.1f s", trajectory_->duration());
           transition(fly_figure_eight_ ? State::FigureEight : State::Follow);
         }
@@ -199,7 +207,13 @@ private:
         break;
 
       case State::Follow:
-        if (trajectory_finished()) {
+        while (!queue_.empty() && now() >= queue_.front().start) {
+          follow(queue_.front().trajectory, queue_.front().start);
+          queue_.pop_front();
+          RCLCPP_INFO(get_logger(), "Continuing on new trajectory: %.1f s",
+            trajectory_->duration());
+        }
+        if (queue_.empty() && trajectory_finished()) {
           transition(State::Hover);
         }
         break;
@@ -251,12 +265,13 @@ private:
   // PX4 local frame -> world frame offset, from the TF pose and PX4's estimate of the same
   // pose. Only valid while the drone is still (on the ground, before arming), when the
   // latest of each describe the same instant. EKF2 reports a valid position before it
-  // has fused the first vision heights, so wait until the offset has been steady for a
-  // while. Returns true once it has.
+  // has fused the first vision heights, so wait until the offset has stayed within a few
+  // cm for a while, and average it over that time (EKF2's height wanders ~1-2 cm while
+  // landed). Returns true once done.
   bool measure_px4_offset()
   {
-    constexpr double kSteadyTime = 2.0;       // [s]
-    constexpr double kSteadyTolerance = 0.01;  // [m]
+    constexpr double kSteadyTime = 2.0;        // [s]
+    constexpr double kSteadyTolerance = 0.03;  // [m]
     geometry_msgs::msg::TransformStamped tf;
     try {
       tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
@@ -270,11 +285,15 @@ private:
     if (!steady_since_ || (offset - steady_offset_).norm() > kSteadyTolerance) {
       steady_offset_ = offset;
       steady_since_ = now();
+      offset_sum_.setZero();
+      offset_samples_ = 0;
     }
+    offset_sum_ += offset;
+    ++offset_samples_;
     if ((now() - *steady_since_).seconds() < kSteadyTime) {
       return false;
     }
-    px4_offset_ = offset;
+    px4_offset_ = offset_sum_ / offset_samples_;
     xy_resets_ = position_->xy_reset_counter;
     z_resets_ = position_->z_reset_counter;
     have_offset_ = true;
@@ -310,9 +329,9 @@ private:
 
   void on_trajectory(const drone_interfaces::msg::WaypointTrajectory & msg)
   {
-    if (fly_figure_eight_ || state_ != State::Hover) {
-      RCLCPP_WARN(get_logger(), "Trajectory ignored: only accepted while hovering with "
-        "figure_eight.enabled = false (state %s)", name(state_));
+    if (fly_figure_eight_ || (state_ != State::Hover && state_ != State::Follow)) {
+      RCLCPP_WARN(get_logger(), "Trajectory ignored: only accepted while hovering or following "
+        "one, with figure_eight.enabled = false (state %s)", name(state_));
       return;
     }
     if (msg.header.frame_id != world_frame_) {
@@ -327,15 +346,60 @@ private:
       RCLCPP_WARN(get_logger(), "Invalid trajectory ignored: %s", e.what());
       return;
     }
+    const rclcpp::Time stamp(msg.header.stamp, get_clock()->get_clock_type());
     const TrajectoryPoint start = trajectory->sample(0.0);
+    if (state_ == State::Follow) {
+      continue_with(trajectory, stamp);
+      return;
+    }
+    if (!start.velocity.isZero() || !start.acceleration.isZero()) {
+      RCLCPP_WARN(get_logger(), "Trajectory starts moving but nothing is being flown; ignored");
+      return;
+    }
     const double error = (start.position - hold_point_.position).norm();
     if (error > max_start_error_) {
       RCLCPP_WARN(get_logger(), "Trajectory starts %.2f m from the hold point (max %.2f); ignored",
         error, max_start_error_);
       return;
     }
-    turn_then_follow(
-      trajectory, start.yaw, rclcpp::Time(msg.header.stamp, get_clock()->get_clock_type()));
+    turn_then_follow(trajectory, start.yaw, stamp);
+  }
+
+  // Take over at `start` from what will be flown then (the current trajectory, or the last
+  // continuation queued to start by then), whose state there the new one must pick up
+  // exactly. Queued continuations starting at or after it are dropped.
+  void continue_with(TrajectoryPtr trajectory, const rclcpp::Time & start)
+  {
+    const double lead = (start - now()).seconds();
+    if (lead <= 0.0) {
+      RCLCPP_WARN(get_logger(), "Continuation arrived %.3f s after its start time; ignored", -lead);
+      return;
+    }
+    const Trajectory * base = trajectory_.get();
+    rclcpp::Time base_start = trajectory_start_;
+    for (const auto & queued : queue_) {
+      if (queued.start < start) {
+        base = queued.trajectory.get();
+        base_start = queued.start;
+      }
+    }
+    const TrajectoryPoint from = base->sample((start - base_start).seconds());
+    const TrajectoryPoint to = trajectory->sample(0.0);
+    const double dp = (to.position - from.position).norm();
+    const double dv = (to.velocity - from.velocity).norm();
+    const double da = (to.acceleration - from.acceleration).norm();
+    const double dyaw = std::abs(wrap_angle(to.yaw - from.yaw));
+    const double drate = std::abs(to.yaw_rate - from.yaw_rate);
+    if (dp > 0.01 || dv > 0.01 || da > 0.01 || dyaw > 0.01 || drate > 0.01) {
+      RCLCPP_WARN(get_logger(), "Continuation doesn't match the current trajectory at its start "
+        "(%.3f m, %.3f m/s, %.3f m/s^2, %.3f rad, %.3f rad/s); ignored", dp, dv, da, dyaw, drate);
+      return;
+    }
+    while (!queue_.empty() && queue_.back().start >= start) {
+      queue_.pop_back();
+    }
+    queue_.push_back({std::move(trajectory), start});
+    RCLCPP_INFO(get_logger(), "Continuation accepted, takes over in %.2f s", lead);
   }
 
   // Face along the trajectory before moving, so the heading doesn't jump at the start.
@@ -356,6 +420,13 @@ private:
     trajectory_ = std::move(trajectory);
     trajectory_start_ = start;
     publish_path(*trajectory_);
+    // Only the planner's trajectories can be continued.
+    if (const auto w = std::dynamic_pointer_cast<const WaypointTrajectory>(trajectory_)) {
+      auto msg = to_msg(*w);
+      msg.header.stamp = start;
+      msg.header.frame_id = world_frame_;
+      active_pub_->publish(msg);
+    }
   }
 
   void publish_path(const Trajectory & trajectory)
@@ -477,7 +548,9 @@ private:
   Eigen::Vector3d px4_offset_{Eigen::Vector3d::Zero()};  // world = PX4 local (ENU) + offset
   bool have_offset_{false};
   std::optional<rclcpp::Time> steady_since_;  // offset within tolerance of steady_offset_
-  Eigen::Vector3d steady_offset_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d steady_offset_{Eigen::Vector3d::Zero()};  // first offset of the window
+  Eigen::Vector3d offset_sum_{Eigen::Vector3d::Zero()};
+  int offset_samples_{0};
   uint8_t xy_resets_{0}, z_resets_{0};
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -488,8 +561,14 @@ private:
   double last_command_time_{-std::numeric_limits<double>::infinity()};
   TrajectoryPtr trajectory_;
   rclcpp::Time trajectory_start_{now()};
-  TrajectoryPtr pending_;  // flown after the turn in State::Turn
+  TrajectoryPtr pending_;  // flown after the turn (Turn)
   rclcpp::Time pending_start_{now()};
+  struct Queued
+  {
+    TrajectoryPtr trajectory;
+    rclcpp::Time start;
+  };
+  std::deque<Queued> queue_;  // continuations waiting to take over (Follow), by start
   TrajectoryPoint hold_point_;
 
   rclcpp::Subscription<VehicleStatus>::SharedPtr status_sub_;
@@ -499,6 +578,7 @@ private:
   rclcpp::Publisher<TrajectorySetpoint>::SharedPtr setpoint_pub_;
   rclcpp::Publisher<VehicleCommand>::SharedPtr command_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<drone_interfaces::msg::WaypointTrajectory>::SharedPtr active_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Clock system_clock_{RCL_SYSTEM_TIME};
 };

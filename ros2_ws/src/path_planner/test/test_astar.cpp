@@ -179,6 +179,33 @@ TEST(AStar, VerticalCostChangesAltitudeOnce)
   EXPECT_NEAR(result.cost, (16.0 + 4.0 * std::sqrt(2.0)) * kRes + params.vertical_cost, 1e-9);
 }
 
+TEST(AStar, ClearanceCostCentresPathInGap)
+{
+  // 1.5 m gap (y = 0.75..2.25) above the straight line: the shortest path squeezes past
+  // its lower edge, the clearance cost moves it to the middle.
+  const TestMap map = wall_with_gap(6);
+  AStarPlanner::Params params = wall_params();
+  const auto y_at_wall = [&](const AStarPlanner::Result & result) {
+      for (const auto & p : result.path) {
+        if (std::abs(p.x() - 2.625) < 1e-9) {
+          return p.y();
+        }
+      }
+      return std::numeric_limits<double>::quiet_NaN();
+    };
+
+  params.clearance_cost = 0.0;
+  const auto hugging = AStarPlanner(params).plan(map, kWallStart, kWallGoal);
+  ASSERT_EQ(hugging.status, Status::Success);
+  EXPECT_DOUBLE_EQ(y_at_wall(hugging), 1.125);  // 0.5 m from the edge, lowest free row
+
+  params.clearance_cost = 1.0;
+  const auto centred = AStarPlanner(params).plan(map, kWallStart, kWallGoal);
+  ASSERT_EQ(centred.status, Status::Success);
+  const double y = y_at_wall(centred);
+  EXPECT_TRUE(y == 1.375 || y == 1.625) << y;  // the two middle rows, 0.75 m from both edges
+}
+
 TEST(AStar, RejectsBadStartAndGoal)
 {
   TestMap map(Occupancy::Free);
@@ -196,7 +223,7 @@ TEST(AStar, StopsAtExpansionLimit)
   const TestMap map(Occupancy::Unknown);
   AStarPlanner::Params params;
   params.max_expansions = 50;
-  const auto result = AStarPlanner(params).plan(map, {0, 0, 2}, {40, 40, 2});
+  const auto result = AStarPlanner(params).plan(map, {0, 0, 2}, {15, 15, 2});
   EXPECT_EQ(result.status, Status::ExpansionLimit);
   EXPECT_TRUE(result.path.empty());
 }

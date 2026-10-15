@@ -14,7 +14,10 @@ Project page: https://nfrancinelli.github.io/projects/3d-planner/
   - [x] A* on the live OctoMap, obstacle inflation, cost for unknown space
   - [x] Path shortcutting and smooth trajectory, collision-checked against the map
   - [x] Trajectory server flies the planned trajectory
-- [ ] Milestone 4 – replanning in the factory world
+- [x] Milestone 4 – replanning in the factory world
+  - [x] `factory` world: 1.5 m gaps, a corridor dead-ending at a crate wall
+  - [x] New plans take over a trajectory in flight without a jump
+  - [x] Replanning when the path gets blocked, switching to clearly shorter ways, braking when stuck
 - [ ] Milestone 5 – unknown-cost comparison + demo video
 
 ## Quick start
@@ -25,17 +28,17 @@ Requires Docker (and the NVIDIA container toolkit for GPU rendering).
 docker/build.sh                       # once; builds PX4 + px4_msgs, takes a while
 docker/run.sh                         # shell inside the container, repo's ros2_ws mounted at /ws
 colcon build --symlink-install && source install/setup.bash
-ros2 launch drone_bringup sim.launch.py               # headless Gazebo + RViz (default)
+ros2 launch drone_bringup sim.launch.py               # factory world, headless Gazebo + RViz
 ros2 launch drone_bringup sim.launch.py gui:=true     # also open the Gazebo GUI (heavy)
 ros2 launch drone_bringup sim.launch.py rviz:=false   # nothing on screen
 ros2 launch drone_bringup sim.launch.py localization:=gps   # PX4's GPS/compass estimate
-ros2 launch drone_bringup sim.launch.py figure_eight:=false # hover and fly to clicked goals
+ros2 launch drone_bringup sim.launch.py world:=boxes figure_eight:=true  # fly a figure-eight, land
 ros2 launch drone_bringup sim.launch.py show_free_space:=true  # also publish OctoMap free voxels
 ```
 
 Gazebo runs headless by default (sensors render offscreen on the GPU); RViz shows the drone,
-the commanded trajectory (orange), the flown trail (green) and the OctoMap built from the
-depth camera. The default world is `boxes`; pick another with `world:=<name>`.
+the planned trajectory (coloured by speed), the flown trail (green) and the OctoMap built
+from the depth camera. The default world is `factory`; pick another with `world:=<name>`.
 
 `path_planner` and `trajectory_server` build in Release by default: unoptimized, planning
 is about 25× slower and smoothing about 100× slower.
@@ -46,30 +49,99 @@ Run `docker/run.sh` again from another terminal to attach a second shell to the 
 
 ## Flying to a goal
 
-Launch with `figure_eight:=false` so the drone takes off and hovers, then use **2D Goal Pose**
+Launch the sim: the drone takes off and hovers. Then use **2D Goal Pose**
 in the RViz toolbar to click a goal (flown at `goal_altitude`, 2.5 m by default). The planner
 plans from the drone's current position on the latest OctoMap and shows:
 
 - the raw A* path (magenta): voxel centers, obstacles inflated, unknown space allowed at a cost;
-- the smoothed trajectory (light blue): the A* path shortcut to a few waypoints, then a
-  piecewise quintic through them that rounds each corner within 0.75 m and is checked
-  against the map with the drone's radius.
+- the trajectory, coloured by speed (blue when slow, orange at `max_vel`): the A* path
+  shortcut to a few waypoints, then a piecewise quintic through them that ramps up to
+  `max_vel` on long legs, rounds each corner within 0.75 m, and is checked against the map
+  with the drone's radius;
+- the goal (green sphere), and for 3 s after each replan, the blocked trajectory in red with
+  a red sphere where it came too close to the map.
 
 The planner sends the trajectory to the trajectory server (`drone_interfaces/WaypointTrajectory`
 on `/trajectory`, rebuilt exactly on the other side), which turns the drone to face the first
-leg, flies it and hovers at the goal until the next one. Goals clicked while the drone is
-flying are ignored for now; if no path is found, the drone keeps hovering. Main `path_planner`
-parameters:
+leg, flies it and hovers at the goal until the next one.
+
+The planner pursues the goal until it's reached, replanning as the map grows:
+
+- the rest of the flown trajectory is checked against every new map (5 Hz); when it runs
+  into a newly seen obstacle, a new plan replaces it;
+- every 2 s, a new plan replaces it if it arrives clearly sooner (by 1 s and 10 %);
+- if a blocked trajectory can't be replanned, the drone brakes to a stop, hovers, and tries
+  again every 2 s as the map fills in;
+- if it would come within `emergency_radius` of an obstacle sooner than a new plan could take
+  over, the drone brakes at once.
+
+Every voxel ever seen occupied stays an obstacle for the planner: the worlds are static, and
+OctoMap can open holes in a wall seen at a grazing angle (the surface sits mid-voxel, and
+rays passing along it mark the voxel free), which the planner would otherwise fly through.
+
+A new plan, like a goal clicked mid-flight, continues the current trajectory: it starts
+`replan_lead` (1 s) ahead on it, in exactly its position, velocity, acceleration and heading
+there, and the server switches over at that moment, braking first if the new path heads
+back. In the `factory` world, flying from the start to (19.5, 0) behind the crate wall
+takes about ten replans as the hall comes into view; the drone discovers the dead end,
+climbs over the crates and stops within 15 cm of the goal, in about 40 s. Main `path_planner` parameters:
 
 | Parameter | Default | Effect |
 |---|---|---|
 | `inflation_radius` | 0.5 m | Clearance A* and the shortcut keep from occupied voxels |
 | `unknown_cost` | 1.0 | Extra cost per metre in unknown space (0 = treat as free) |
 | `vertical_cost` | 1.0 | Extra cost per metre of climb or descent, so paths keep their altitude unless climbing pays off |
-| `collision_radius` | 0.4 m | Clearance the smoothed trajectory must keep; ≤ `inflation_radius` |
+| `clearance_radius`, `clearance_cost` | 1.0 m, 1.0 | Within this distance of an obstacle, extra cost per metre rising to `clearance_cost` at `inflation_radius`: paths run down the middle of gaps |
+| `collision_radius` | 0.45 m | Clearance the smoothed and flown trajectory must keep (drone radius 0.39 m); ≤ `inflation_radius` |
 | `corner_distance` | 0.75 m | How far before and after a corner the rounding starts |
+| `replan_lead` | 1.0 s | How far ahead on the current trajectory a new plan takes over; must cover planning time |
+| `check_period`, `improve_period` | 0.2 s, 2.0 s | How often the flown trajectory is checked against the map, and a shorter way looked for |
+| `improve_min_gain`, `improve_min_ratio` | 1.0 s, 0.1 | How much sooner a new plan must arrive to replace the current one |
+| `emergency_radius` | 0.4 m | Closer than this to an obstacle within `replan_lead`: brake at once |
 | `max_vel`, `max_acc` | 1.0 m/s, 1.0 m/s² | Trajectory limits |
 | `bounds_min`, `bounds_max` | (−20, −20, 0.5), (20, 20, 4) m | Search volume |
+
+## Speed and safety
+
+The drone must be able to stop before an obstacle it has just discovered. From the moment
+an obstacle shows up in the camera to the drone stopping, at `max_vel` = 1 m/s and
+`max_acc` = 1 m/s²:
+
+| | |
+|---|---|
+| Reaction, until the brake takes effect | ~0.75 s: map update ~0.2 s, collision check ≤ 0.2 s, brake lead 0.15 s, PX4 response ~0.2 s |
+| Distance flown meanwhile | ~0.9 m (at the 1.18 m/s peak, see below) |
+| Braking (quintic stop, 1.875 v / a long) | 0.94 m |
+| PX4 tracking error | up to 0.18 m |
+| **Total** | **~2.0 m** |
+
+The camera sees 10 m, so in the open 1 m/s is well within limits. Occlusion is the binding
+case: an obstacle hidden behind a corner can first appear much closer, like the face of the
+shelving block that comes into view ~2.5 m away as the drone passes the gap in `factory`.
+That's about the margin above; flying faster would need slowing down near occluding corners.
+
+PX4 overshoots the commanded speed after each acceleration: the drone trails the setpoint
+while it tilts into the acceleration (~0.14 m/s behind on a 1 m/s² ramp), and its position
+loop then makes up the distance. Measured on a straight 10 m leg, the overshoot scales with
+`max_acc`: 16 % at 1 m/s² (peak 1.18 m/s), 10 % at 0.7, 4 % at 0.5. PX4's velocity gains
+barely change it (13–16 %). Lower acceleration tracks better but brakes longer (2.3 m and
+2.7 m total stopping distance), so 1 m/s² stays the default. The planner logs the stopping
+distance for its parameters at startup (reaction and braking, without the overshoot and
+tracking error).
+
+## Measuring a flight
+
+`mission_metrics.py` sends a goal like RViz does, waits for the planner to reach it, and
+reports the flight: time, path length, peak speed and height, replans and brakes, and the
+closest the drone came to an obstacle (from the world's SDF boxes; below the drone's 0.39 m
+radius it touched). `--csv` appends a row per run, for comparing planner settings:
+
+```bash
+ros2 run drone_bringup mission_metrics.py 19.5 0 --csv runs.csv --label "unknown_cost 1"
+```
+
+Runs of the same mission vary by tens of seconds (the map fills in a little differently
+each time, and a run may brake and restart once), so compare averages over a few runs.
 
 ## Localization
 
@@ -80,7 +152,7 @@ isolates the planner, which is what the project evaluates, from state-estimation
 Flying the planner on onboard estimation (e.g. visual-inertial SLAM) is a natural next step.
 
 `localization:=gps` keeps PX4's stock outdoor estimate for comparison. Measured against
-ground truth during the figure-eight, its heading error grows with turn rate (p95 3° below
+ground truth during the figure-eight (`world:=boxes figure_eight:=true`), its heading error grows with turn rate (p95 3° below
 0.2 rad/s, 17° above 0.6 rad/s), which smears obstacles by up to ~2 m at 8 m range:
 
 | figure-eight, `boxes` world | mocap | gps |
@@ -96,7 +168,7 @@ ground truth during the figure-eight, its heading error grows with turn rate (p9
 | `ros2_ws/src/drone_interfaces` | Planner → trajectory server message (`WaypointTrajectory`) |
 | `ros2_ws/src/path_planner` | Planner node on the live OctoMap; ROS-free core with unit tests: A* with obstacle inflation and a cost for unknown space, path shortcutting, trajectory smoothing |
 | `ros2_ws/src/px4_state_bridge` | PX4 odometry → `/odom`, TF, flown trail, drone model for RViz; `mocap_bridge` feeds ground truth to PX4 as external vision |
-| `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world |
+| `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world, `factory` hall (1.5 m gaps, a corridor dead-ending at a crate wall) |
 | `ros2_ws/src/drone_bringup` | Launch files, RViz config |
 
 ## Conventions
@@ -121,6 +193,12 @@ server are stamped with system time.
   state-estimation error is not evaluated yet.
 - Single forward-facing depth camera: test worlds contain no obstacles directly above or
   below the flight path.
-- Each straight leg of a smoothed trajectory is a single quintic, so its average speed is
-  about half of `max_vel`.
-- A* takes ~300 ms per plan in the `boxes` world, too slow for frequent replanning yet.
+- Planning takes up to ~0.55 s while most of the hall is unknown (distance map over the
+  whole planning volume ~70 ms, A* up to ~500 ms), within the 1 s `replan_lead`.
+- Clearances are measured between voxel centers, which can be half a voxel (0.1 m) closer
+  to the real surface: `inflation_radius` (0.5 m) guarantees only ~0.4 m, barely more than
+  the drone's 0.39 m radius. The clearance cost keeps paths centred (~0.35 m of margin each
+  side in a 1.5 m gap); the thin worst case needs an off-centre squeeze.
+- PX4 overshoots the commanded speed by ~16 % after accelerating (see Speed and safety).
+- Obstacles are sticky (static worlds only): a moving obstacle, or a noisy depth reading,
+  would stay in the planner's map for good.

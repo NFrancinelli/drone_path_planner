@@ -1,11 +1,13 @@
 #include <cmath>
 #include <memory>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <octomap/OcTree.h>
 
 #include "path_planner/astar.hpp"
 #include "path_planner/octomap_map.hpp"
+#include "path_planner/sticky_map.hpp"
 
 using path_planner::AStarPlanner;
 using path_planner::Occupancy;
@@ -84,4 +86,76 @@ TEST(OctomapMap, PlansAroundOctreeObstacle)
     }
   }
   EXPECT_TRUE(through_gap);
+}
+
+TEST(OctomapMap, FillMatchesPerVoxelLookups)
+{
+  // Pruned free blocks, scattered occupied voxels, unknown around them, negative keys, and a
+  // box that cuts through coarse leaves.
+  auto tree = std::make_shared<octomap::OcTree>(0.2);
+  for (double x = -1.5; x < 1.7; x += 0.2) {
+    for (double y = -1.5; y < 1.7; y += 0.2) {
+      for (double z = 0.1; z < 1.7; z += 0.2) {
+        tree->updateNode(octomap::point3d(x, y, z), false);
+      }
+    }
+  }
+  for (const auto & p : {octomap::point3d(0.3, 0.5, 0.7), octomap::point3d(-1.1, 0.1, 1.3),
+      octomap::point3d(2.5, -0.3, 0.9)})
+  {
+    tree->updateNode(p, true);
+  }
+  tree->updateInnerOccupancy();
+  tree->prune();
+  const path_planner::OctomapMap map(tree);
+
+  const path_planner::Key lo = map.key({-1.3, -0.9, -0.3});
+  const path_planner::Key size(22, 17, 12);
+  std::vector<path_planner::Occupancy> filled;
+  map.fill(lo, size, filled);
+  ASSERT_EQ(filled.size(), 22u * 17u * 12u);
+  size_t i = 0, occupied = 0;
+  for (int z = 0; z < size.z(); ++z) {
+    for (int y = 0; y < size.y(); ++y) {
+      for (int x = 0; x < size.x(); ++x, ++i) {
+        const path_planner::Key k = lo + path_planner::Key(x, y, z);
+        EXPECT_EQ(filled[i], map.at(k)) << k.transpose();
+        occupied += filled[i] == path_planner::Occupancy::Occupied;
+      }
+    }
+  }
+  EXPECT_EQ(occupied, 3u);
+}
+
+TEST(StickyMap, KeepsObstaclesTheMapHasSinceErased)
+{
+  // A wall voxel seen occupied, then marked free by later rays: still an obstacle.
+  auto tree = std::make_shared<octomap::OcTree>(0.2);
+  const octomap::point3d wall(1.1, 0.7, 2.5), other(1.3, 0.7, 2.5);
+  tree->updateNode(wall, true);
+  tree->updateNode(other, true);
+  const path_planner::OctomapMap map(tree);
+  path_planner::KeySet seen;
+  map.collect_occupied(seen);
+  EXPECT_EQ(seen.size(), 2u);
+
+  for (int i = 0; i < 20; ++i) {
+    tree->updateNode(wall, false);
+  }
+  const path_planner::Key k = map.key({1.1, 0.7, 2.5});
+  ASSERT_EQ(map.at(k), path_planner::Occupancy::Free);
+  const path_planner::StickyMap sticky(map, seen);
+  EXPECT_EQ(sticky.at(k), path_planner::Occupancy::Occupied);
+  EXPECT_EQ(sticky.at(map.key({0.1, 0.1, 0.1})), path_planner::Occupancy::Unknown);
+
+  // fill() agrees, inside the box only.
+  const path_planner::Key lo = k - path_planner::Key(1, 1, 1), size(3, 3, 3);
+  std::vector<path_planner::Occupancy> filled;
+  sticky.fill(lo, size, filled);
+  size_t occupied = 0;
+  for (const auto o : filled) {
+    occupied += o == path_planner::Occupancy::Occupied;
+  }
+  EXPECT_EQ(occupied, 2u);  // the erased wall voxel and its neighbour
+  EXPECT_EQ(filled[(1 * 3 + 1) * 3 + 1], path_planner::Occupancy::Occupied);
 }

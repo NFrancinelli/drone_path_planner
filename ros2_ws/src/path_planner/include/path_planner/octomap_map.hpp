@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include <octomap/OcTree.h>
 
@@ -32,6 +33,62 @@ public:
       return Occupancy::Unknown;
     }
     return tree_->isNodeOccupied(node) ? Occupancy::Occupied : Occupancy::Free;
+  }
+
+  // Iterates the octree's leaves in the box instead of searching every voxel: a large free
+  // or unknown region is a single coarse leaf (or no node at all).
+  void fill(const Key & lo, const Key & size, std::vector<Occupancy> & out) const override
+  {
+    const long nx = size.x(), ny = size.y(), nz = size.z();
+    out.assign(nx * ny * nz, Occupancy::Unknown);
+    const double res = resolution();
+    const Key hi = lo + size - Key::Ones();
+    const octomap::point3d min(lo.x() * res, lo.y() * res, lo.z() * res);
+    const octomap::point3d max((hi.x() + 1) * res, (hi.y() + 1) * res, (hi.z() + 1) * res);
+    for (auto it = tree_->begin_leafs_bbx(min, max), end = tree_->end_leafs_bbx(); it != end;
+      ++it)
+    {
+      const Occupancy occ = tree_->isNodeOccupied(*it) ? Occupancy::Occupied : Occupancy::Free;
+      // Voxels the leaf covers (several for a pruned leaf), clipped to the box. Keys from the
+      // leaf's corner, offset by half a voxel to stay clear of rounding at the boundaries.
+      const double half = it.getSize() / 2.0;
+      const octomap::point3d c = it.getCoordinate();
+      const Eigen::Vector3d corner(c.x() - half, c.y() - half, c.z() - half);
+      const Key a = key(corner + Eigen::Vector3d::Constant(res / 2.0));
+      const Key b = key(corner + Eigen::Vector3d::Constant(2.0 * half - res / 2.0));
+      const Key from = a.cwiseMax(lo), to = b.cwiseMin(hi);
+      for (int z = from.z(); z <= to.z(); ++z) {
+        for (int y = from.y(); y <= to.y(); ++y) {
+          long i = ((z - lo.z()) * ny + (y - lo.y())) * nx + (from.x() - lo.x());
+          for (int x = from.x(); x <= to.x(); ++x) {
+            out[i++] = occ;
+          }
+        }
+      }
+    }
+  }
+
+  // Adds every occupied voxel to `out` (all the voxels a coarse occupied leaf covers).
+  void collect_occupied(KeySet & out) const
+  {
+    const double res = resolution();
+    for (auto it = tree_->begin_leafs(), end = tree_->end_leafs(); it != end; ++it) {
+      if (!tree_->isNodeOccupied(*it)) {
+        continue;
+      }
+      const double half = it.getSize() / 2.0;
+      const octomap::point3d c = it.getCoordinate();
+      const Eigen::Vector3d corner(c.x() - half, c.y() - half, c.z() - half);
+      const Key a = key(corner + Eigen::Vector3d::Constant(res / 2.0));
+      const Key b = key(corner + Eigen::Vector3d::Constant(2.0 * half - res / 2.0));
+      for (int z = a.z(); z <= b.z(); ++z) {
+        for (int y = a.y(); y <= b.y(); ++y) {
+          for (int x = a.x(); x <= b.x(); ++x) {
+            out.insert(Key(x, y, z));
+          }
+        }
+      }
+    }
   }
 
 private:

@@ -6,13 +6,11 @@
 #include <gtest/gtest.h>
 
 #include "path_planner/astar.hpp"
-#include "path_planner/inflated_map.hpp"
 #include "path_planner/smoothing.hpp"
 #include "trajectory_server/frames.hpp"
 #include "test_map.hpp"
 
 using path_planner::AStarPlanner;
-using path_planner::InflatedMap;
 using path_planner::SmoothingParams;
 using path_planner::shortcut;
 using path_planner::smooth;
@@ -73,6 +71,13 @@ void expect_within_limits(const trajectory_server::Trajectory & traj, const Smoo
   }
 }
 
+// Knots where the drone is at rest (start, stops, end; not the moving ones on legs).
+size_t rest_knots(const trajectory_server::WaypointTrajectory & traj)
+{
+  return std::count_if(traj.knots().begin(), traj.knots().end(),
+           [](const auto & k) {return k.velocity.norm() < 1e-12;});
+}
+
 // Largest distance from the trajectory to the polyline through `path`.
 double max_deviation(const trajectory_server::Trajectory & traj, const Path & path)
 {
@@ -107,7 +112,7 @@ TEST(Shortcut, StraightensZigZagInFreeSpace)
 {
   const TestMap map(Occupancy::Free);
   const Path zigzag{{0, 0, 2}, {0.5, 0.5, 2}, {1, 0, 2}, {1.5, 0.5, 2}, {2, 0, 2}};
-  const Path out = shortcut(map, zigzag, AStarPlanner::Params{});
+  const Path out = shortcut(distances(map), zigzag, AStarPlanner::Params{});
   ASSERT_EQ(out.size(), 2u);
   EXPECT_EQ(out.front(), zigzag.front());
   EXPECT_EQ(out.back(), zigzag.back());
@@ -123,15 +128,15 @@ TEST(Shortcut, KeepsClearanceThroughGap)
   const auto raw = AStarPlanner(params).plan(map, start, goal);
   ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
 
-  const Path out = shortcut(map, raw.path, params);
+  const Path out = shortcut(distances(map), raw.path, params);
   EXPECT_LT(out.size(), raw.path.size());
   EXPECT_LE(out.size(), 5u);
   EXPECT_EQ(out.front(), start);
   EXPECT_EQ(out.back(), goal);
   EXPECT_LE(length(out), length(raw.path) + 1e-9);
-  const InflatedMap inflated(map, params.inflation_radius);
+  const auto dist = distances(map);
   for (const auto & p : densify(map, out)) {
-    EXPECT_FALSE(inflated.blocked(p)) << p.transpose();
+    EXPECT_GT(dist.distance(dist.key(p)), params.inflation_radius) << p.transpose();
   }
 }
 
@@ -148,7 +153,7 @@ TEST(Shortcut, DoesNotCutThroughUnknownTheSearchAvoided)
   const auto raw = AStarPlanner(params).plan(map, {0.125, 0.125, kLayerZ}, {4.125, 0.125, kLayerZ});
   ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
 
-  const Path out = shortcut(map, raw.path, params);
+  const Path out = shortcut(distances(map), raw.path, params);
   EXPECT_LT(out.size(), raw.path.size());
   for (const auto & p : densify(map, out)) {
     EXPECT_EQ(map.at(map.key(p)), Occupancy::Free) << p.transpose();
@@ -159,7 +164,7 @@ TEST(Smooth, KeepsMovingThroughFreeCorner)
 {
   const TestMap map(Occupancy::Free);
   const SmoothingParams params;
-  const auto result = smooth(map, kCorner, params);
+  const auto result = smooth(distances(map), kCorner, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   EXPECT_EQ(result.stopped_knots, 0);
@@ -178,15 +183,16 @@ TEST(Smooth, StopsAtCornerWhenTheCurveWouldHitAnObstacle)
   TestMap map(Occupancy::Free);
   map.set_box({2.9, -0.3, 1.5}, {2.9, -0.3, 2.8}, Occupancy::Occupied);
   const SmoothingParams params;
-  const auto result = smooth(map, kCorner, params);
+  const auto result = smooth(distances(map), kCorner, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   EXPECT_EQ(result.stopped_knots, 1);
-  EXPECT_EQ(traj.knots().size(), 3u);  // start, stopped corner, goal
+  EXPECT_EQ(rest_knots(traj), 3u);  // start, stopped corner, goal
   EXPECT_LT(traj.sample(traj.knot_time(knot_at(traj, kCorner[1]))).velocity.norm(), 1e-9);
-  const InflatedMap clearance(map, params.collision_radius);
+  const auto dist = distances(map);
   for (double t = 0.0; t <= traj.duration(); t += 0.02) {
-    EXPECT_FALSE(clearance.blocked(traj.sample(t).position)) << "t = " << t;
+    const auto k = dist.key(traj.sample(t).position);
+    EXPECT_GT(dist.distance(k), params.collision_radius) << "t = " << t;
   }
   expect_within_limits(traj, params);
 }
@@ -195,7 +201,7 @@ TEST(Smooth, YawFacesEachLegByItsCornerAndHoldsThroughClimbs)
 {
   const TestMap map(Occupancy::Free);
   const Path path{{0, 0, 1}, {2, 0, 1}, {2, 0, 3}, {2, 2, 3}};
-  const auto result = smooth(map, path, SmoothingParams{});
+  const auto result = smooth(distances(map), path, SmoothingParams{});
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   const auto yaw_at = [&](const Eigen::Vector3d & p) {
@@ -208,11 +214,152 @@ TEST(Smooth, YawFacesEachLegByItsCornerAndHoldsThroughClimbs)
   ASSERT_EQ(traj.turns().size(), 1u);
 }
 
+TEST(Smooth, ContinuesFromAMovingStart)
+{
+  // Takes over in flight: moving along the first leg, accelerating, and turning.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 0, 2}, {4, 0, 2}, {4, 4, 2}};
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0.8, 0.3, 0};
+  start.acceleration = {0.2, -0.1, 0};
+  start.yaw = 0.4;
+  start.yaw_rate = 0.3;
+  const auto result = smooth(distances(map), path, params, start);
+  ASSERT_TRUE(result.trajectory);
+  const auto & traj = *result.trajectory;
+
+  const auto p = traj.sample(0.0);
+  EXPECT_LT((p.position - path.front()).norm(), 1e-12);
+  EXPECT_LT((p.velocity - start.velocity).norm(), 1e-12);
+  EXPECT_LT((p.acceleration - start.acceleration).norm(), 1e-12);
+  EXPECT_NEAR(p.yaw, 0.4, 1e-12);
+  EXPECT_NEAR(p.yaw_rate, 0.3, 1e-12);
+  // Turns to face the first leg (east) first.
+  ASSERT_FALSE(traj.turns().empty());
+  const auto & first = traj.turns().front();
+  EXPECT_EQ(first.start, 0.0);
+  EXPECT_NEAR(traj.sample(first.duration).yaw, 0.0, 1e-9);
+  expect_within_limits(traj, params);
+  EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
+}
+
+TEST(Smooth, TurnsRoundAStartMovingAwayFromTheFirstLeg)
+{
+  // Replanning can reverse the direction of travel: the drone has to stop and come back.
+  const TestMap map(Occupancy::Free);
+  const Path path{{2, 2, 2}, {0, 2, 2}};
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0.9, 0, 0};
+  start.yaw = 0.0;
+  const auto result = smooth(distances(map), path, params, start);
+  ASSERT_TRUE(result.trajectory);
+  const auto & traj = *result.trajectory;
+  EXPECT_LT((traj.sample(0.0).velocity - start.velocity).norm(), 1e-12);
+  EXPECT_NEAR(traj.sample(traj.duration()).yaw, M_PI, 1e-9);
+  expect_within_limits(traj, params);
+  // Overshoots the start by about the braking distance, v^2 / 2a, then comes back.
+  double furthest = 0.0;
+  for (double t = 0.0; t <= traj.duration(); t += 0.01) {
+    furthest = std::max(furthest, traj.sample(t).position.x());
+  }
+  EXPECT_GT(furthest, 2.0 + 0.9 * 0.9 / (2 * params.max_acc) - 0.05);
+  EXPECT_LT(furthest, 2.0 + 1.5);
+  EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
+}
+
+TEST(Smooth, BrakesBeforeReversingOntoALongLeg)
+{
+  // From the sim: still accelerating north when the new goal sends it 7 m south. No single
+  // segment can turn that round within the limits, so it brakes to a stop first.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 1.367, 2.5}, {0, -6, 2.5}};
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0, 0.793, 0};
+  start.acceleration = {0, 0.186, 0};
+  start.yaw = M_PI_2;
+  const auto result = smooth(distances(map), path, params, start);
+  ASSERT_TRUE(result.trajectory) << result.failure;
+  const auto & traj = *result.trajectory;
+  EXPECT_EQ(rest_knots(traj), 2u);  // stop, goal
+  EXPECT_LT(traj.knots()[1].velocity.norm(), 1e-12);  // the stop comes first
+  expect_within_limits(traj, params);
+  EXPECT_LT((traj.sample(traj.duration()).position - path.back()).norm(), 1e-9);
+}
+
+TEST(Brake, StopsStraightAheadWithinLimits)
+{
+  const SmoothingParams params;
+  path_planner::StartState start;
+  start.velocity = {0.8, 0.2, 0};
+  start.acceleration = {0.2, 0, 0};
+  start.yaw = 0.3;
+  start.yaw_rate = 0.4;
+  const Eigen::Vector3d from(1, 1, 2);
+  const auto traj = path_planner::brake(from, start, params);
+  ASSERT_TRUE(traj);
+  const auto p0 = traj->sample(0.0);
+  EXPECT_LT((p0.velocity - start.velocity).norm(), 1e-12);
+  EXPECT_LT((p0.acceleration - start.acceleration).norm(), 1e-12);
+  EXPECT_NEAR(p0.yaw_rate, 0.4, 1e-12);
+  const auto end = traj->sample(traj->duration());
+  EXPECT_LT(end.velocity.norm(), 1e-12);
+  EXPECT_NEAR(end.yaw_rate, 0.0, 1e-12);
+  // Ahead, along the velocity, within a couple of braking distances.
+  const Eigen::Vector3d travel = end.position - from;
+  EXPECT_GT(travel.dot(start.velocity.normalized()), 0.0);
+  EXPECT_LT(travel.norm(), 2.0 * start.velocity.squaredNorm() / params.max_acc + 0.3);
+  expect_within_limits(*traj, params);
+}
+
+TEST(FirstCollision, FindsWhereATrajectoryRunsIntoTheMap)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({3.1, -2.0, 0.0}, {3.1, 2.0, 4.0}, Occupancy::Occupied);  // wall x = 3..3.25
+  const trajectory_server::QuinticLine line({0, 0, 2.125}, {6, 0, 2.125}, 0.0, 12.0);
+
+  const auto t = path_planner::first_collision(map, line, 0.0, 0.4);
+  ASSERT_TRUE(t);
+  // First within 0.4 m of the wall's voxel centers (x = 3.125).
+  const double x = line.sample(*t).position.x();
+  EXPECT_GT(x, 3.125 - 0.4 - 0.25);
+  EXPECT_LT(x, 3.125 - 0.4 + 0.05);
+  // Nothing past the wall, nor on a path well clear of it.
+  EXPECT_FALSE(path_planner::first_collision(map, line, 9.0, 0.4));
+  const trajectory_server::QuinticLine clear({0, 3, 2.125}, {6, 3, 2.125}, 0.0, 12.0);
+  EXPECT_FALSE(path_planner::first_collision(map, clear, 0.0, 0.4));
+}
+
+TEST(Smooth, CruisesAtMaxSpeedOnLongLegs)
+{
+  // A 10 m leg ramps up, cruises at (nearly) max_vel, ramps down: ~12 s instead of the
+  // ~19 s one quintic takes, which averages about half its peak speed.
+  const TestMap map(Occupancy::Free);
+  const Path path{{0, 0, 2}, {10, 0, 2}};
+  const SmoothingParams params;
+  const auto result = smooth(distances(map), path, params);
+  ASSERT_TRUE(result.trajectory) << result.failure;
+  const auto & traj = *result.trajectory;
+  EXPECT_EQ(traj.knots().size(), 4u);
+  EXPECT_NEAR(traj.sample(traj.duration() / 2).velocity.x(), 0.99 * params.max_vel, 1e-9);
+  const double ramp = 1.875 * std::pow(0.99, 2) / (2 * 0.99 * params.max_acc);
+  EXPECT_NEAR(traj.duration(), 2 * (2 * ramp / 0.99) + (10 - 2 * ramp) / 0.99, 1e-9);
+  expect_within_limits(traj, params);
+  // Still a straight line, never backwards.
+  for (double t = 0.0; t <= traj.duration(); t += 0.01) {
+    const auto p = traj.sample(t);
+    EXPECT_LT(std::abs(p.position.y()) + std::abs(p.position.z() - 2), 1e-9) << "t = " << t;
+    EXPECT_GE(p.velocity.x(), -1e-9) << "t = " << t;
+  }
+}
+
 TEST(Smooth, RejectsDegeneratePath)
 {
   const TestMap map(Occupancy::Free);
-  EXPECT_FALSE(smooth(map, {{1, 1, 1}}, SmoothingParams{}).trajectory);
-  EXPECT_FALSE(smooth(map, {{1, 1, 1}, {1, 1, 1}}, SmoothingParams{}).trajectory);
+  EXPECT_FALSE(smooth(distances(map), {{1, 1, 1}}, SmoothingParams{}).trajectory);
+  EXPECT_FALSE(smooth(distances(map), {{1, 1, 1}, {1, 1, 1}}, SmoothingParams{}).trajectory);
 }
 
 TEST(Smooth, CornersStayCloseToTheStraightPath)
@@ -222,8 +369,8 @@ TEST(Smooth, CornersStayCloseToTheStraightPath)
   const TestMap map(Occupancy::Free);
   const SmoothingParams params;
   const Path shallow{{0, 0, 2}, {4, 0, 2}, {7, 2.5, 2}};  // ~40 deg turn
-  const auto sharp = smooth(map, kCorner, params);
-  const auto gentle = smooth(map, shallow, params);
+  const auto sharp = smooth(distances(map), kCorner, params);
+  const auto gentle = smooth(distances(map), shallow, params);
   ASSERT_TRUE(sharp.trajectory);
   ASSERT_TRUE(gentle.trajectory);
   EXPECT_LT(max_deviation(*sharp.trajectory, kCorner), 0.15);
@@ -245,7 +392,7 @@ TEST(Smooth, CloseCornersDoNotSlowTheFlightForYaw)
   const TestMap map(Occupancy::Free);
   const Path path{{0, 0, 2.77}, {1.1, 0.9, 2.7}, {1.7, 1.5, 2.5}, {2.1, 1.9, 2.5}, {2.0, 6.5, 2.5}};
   const SmoothingParams params;
-  const auto result = smooth(map, path, params);
+  const auto result = smooth(distances(map), path, params);
   ASSERT_TRUE(result.trajectory);
   const auto & traj = *result.trajectory;
   for (size_t k = 1; k + 1 < path.size(); ++k) {

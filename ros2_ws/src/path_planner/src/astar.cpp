@@ -2,12 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <queue>
-#include <unordered_map>
-#include <unordered_set>
+#include <stdexcept>
 #include <utility>
 
-#include "path_planner/inflated_map.hpp"
 
 namespace path_planner
 {
@@ -61,10 +61,30 @@ AStarPlanner::AStarPlanner(const Params & params)
 {
 }
 
+double step_weight(const AStarPlanner::Params & params, const DistanceMap & map, const Key & k)
+{
+  double weight = map.at(k) == Occupancy::Unknown ? 1.0 + params.unknown_cost : 1.0;
+  const double band = params.clearance_radius - params.inflation_radius;
+  if (band > 0.0) {
+    const double closeness = (params.clearance_radius - map.distance(k)) / band;
+    weight += params.clearance_cost * std::clamp(closeness, 0.0, 1.0);
+  }
+  return weight;
+}
+
 AStarPlanner::Result AStarPlanner::plan(
   const OccupancyMap & map, const Eigen::Vector3d & start, const Eigen::Vector3d & goal) const
 {
+  return plan(DistanceMap(map, p_.bounds, max_distance()), start, goal);
+}
+
+AStarPlanner::Result AStarPlanner::plan(
+  const DistanceMap & map, const Eigen::Vector3d & start, const Eigen::Vector3d & goal) const
+{
   static const std::vector<Step> kNeighbours = make_neighbours();
+  if (map.max_distance() < max_distance() - 1e-9) {
+    throw std::invalid_argument("Distance map too short-ranged for these planner params");
+  }
 
   Result result;
   const double res = map.resolution();
@@ -81,8 +101,8 @@ AStarPlanner::Result AStarPlanner::plan(
     return result;
   }
 
-  const InflatedMap inflated(map, p_.inflation_radius);
-  if (inflated.blocked(goal_key)) {
+  const auto blocked = [&](const Key & k) {return map.distance(k) <= p_.inflation_radius;};
+  if (blocked(goal_key)) {
     result.status = Status::GoalBlocked;
     return result;
   }
@@ -94,23 +114,29 @@ AStarPlanner::Result AStarPlanner::plan(
       return (d.cast<double>().norm() + p_.vertical_cost * std::abs(d.z())) * res;
     };
 
+  // Search state in flat arrays over the distance map's grid (which covers the bounds):
+  // much faster than hash maps, and the grid is allocated per plan anyway.
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  std::vector<double> g(map.cells(), kInf);
+  std::vector<int8_t> parent(map.cells(), -1);  // index into kNeighbours of the step in
+  std::vector<uint8_t> closed(map.cells(), 0);
   std::priority_queue<OpenEntry, std::vector<OpenEntry>, OpenCompare> open;
-  std::unordered_map<Key, double, KeyHash> g{{start_key, 0.0}};
-  std::unordered_map<Key, Key, KeyHash> parent;
-  std::unordered_set<Key, KeyHash> closed;
+  g[map.index(start_key)] = 0.0;
   open.push({heuristic(start_key), 0.0, start_key});
 
   while (!open.empty()) {
     const OpenEntry node = open.top();
     open.pop();
-    if (!closed.insert(node.key).second) {
+    const long i = map.index(node.key);
+    if (closed[i]) {
       continue;  // stale entry
     }
+    closed[i] = 1;
 
     if (node.key == goal_key) {
       std::vector<Key> keys{goal_key};
       while (keys.back() != start_key) {
-        keys.push_back(parent.at(keys.back()));
+        keys.push_back(keys.back() - kNeighbours[parent[map.index(keys.back())]].offset);
       }
       std::reverse(keys.begin(), keys.end());
       result.path.push_back(start);
@@ -128,19 +154,23 @@ AStarPlanner::Result AStarPlanner::plan(
       return result;
     }
 
-    for (const Step & step : kNeighbours) {
+    for (size_t s = 0; s < kNeighbours.size(); ++s) {
+      const Step & step = kNeighbours[s];
       const Key next = node.key + step.offset;
-      if (closed.count(next) || !in_bounds(next) || inflated.blocked(next)) {
+      if (!in_bounds(next)) {
+        continue;  // also keeps index() inside the grid, which covers the bounds
+      }
+      const long j = map.index(next);
+      if (closed[j] || blocked(next)) {
         continue;
       }
-      const double weight = map.at(next) == Occupancy::Unknown ? 1.0 + p_.unknown_cost : 1.0;
+      const double weight = step_weight(p_, map, next);
       const double cost = node.g + (step.length * weight + p_.vertical_cost * step.climb) * res;
-      auto [it, inserted] = g.try_emplace(next, cost);
-      if (!inserted && cost >= it->second) {
+      if (cost >= g[j]) {
         continue;
       }
-      it->second = cost;
-      parent[next] = node.key;
+      g[j] = cost;
+      parent[j] = static_cast<int8_t>(s);
       open.push({cost + heuristic(next), cost, next});
     }
   }

@@ -231,12 +231,13 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("world", default_value="boxes", description="world in drone_sim/worlds"),
+        DeclareLaunchArgument("world", default_value="factory", description="world in drone_sim/worlds"),
         DeclareLaunchArgument("gui", default_value="false", description="open the Gazebo GUI"),
         DeclareLaunchArgument("rviz", default_value="true"),
         DeclareLaunchArgument("mission", default_value="true", description="run the trajectory server"),
-        DeclareLaunchArgument("figure_eight", default_value="true",
-                              description="false: take off, hover and fly planner trajectories instead"),
+        DeclareLaunchArgument("figure_eight", default_value="false",
+                              description="true: fly a figure-eight and land instead of flying planner "
+                                          "trajectories (needs open space: world:=boxes)"),
         DeclareLaunchArgument("map_resolution", default_value="0.2", description="OctoMap voxel size [m]"),
         DeclareLaunchArgument("show_free_space", default_value="false",
                               description="publish OctoMap free voxels on /free_cells_vis_array"),

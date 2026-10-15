@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
-#include "path_planner/inflated_map.hpp"
 #include "trajectory_server/frames.hpp"
 
 namespace path_planner
@@ -25,20 +25,18 @@ struct SegmentCheck
 
 // Samples a -> b every quarter voxel. Cost uses the A* weighting per sampled voxel.
 SegmentCheck check_segment(
-  const InflatedMap & inflated, const Key & exempt, const Eigen::Vector3d & a,
+  const DistanceMap & map, const Key & exempt, const Eigen::Vector3d & a,
   const Eigen::Vector3d & b, const AStarPlanner::Params & params)
 {
-  const OccupancyMap & map = inflated.map();
   const double length = (b - a).norm();
   const int n = std::max(1, static_cast<int>(std::ceil(length / (0.25 * map.resolution()))));
   SegmentCheck check;
   for (int i = 1; i <= n; ++i) {
     const Key k = map.key(a + (b - a) * (static_cast<double>(i) / n));
-    if (k != exempt && inflated.blocked(k)) {
+    if (k != exempt && map.distance(k) <= params.inflation_radius) {
       check.clear = false;
     }
-    const double weight = map.at(k) == Occupancy::Unknown ? 1.0 + params.unknown_cost : 1.0;
-    check.cost += weight * length / n;
+    check.cost += step_weight(params, map, k) * length / n;
   }
   check.cost += params.vertical_cost * std::abs(b.z() - a.z());
   return check;
@@ -47,31 +45,32 @@ SegmentCheck check_segment(
 // Below this a corner isn't worth rounding and the drone just stops there.
 constexpr double kMinCornerSpeed = 0.05;  // [m/s]
 
-// Shortest duration for a segment between two knots (zero acceleration at both) that keeps
-// speed and acceleration within limits and never moves backwards along the segment.
-// Candidates go from 3x the rest-to-rest duration down to a small fraction of it: moving
-// knots can need longer (speeding up from rest to a fast corner) or much shorter. The
-// rest-to-rest duration itself always fits when both knots are at rest. Returns 0 when
-// none fits, i.e. the knot speeds are too high for this segment.
+// Shortest duration for a segment between two knots that keeps speed and acceleration
+// within limits and, unless allow_reverse, never moves backwards along the segment.
+// Candidates go from 3x the rest-to-rest duration (plus time to turn a moving start round)
+// down to a small fraction of it: moving knots can need longer (speeding up from rest to a
+// fast corner) or much shorter. The rest-to-rest duration itself always fits when both
+// knots are at rest. Returns 0 when none fits, i.e. the knot speeds are too high for this
+// segment.
 double segment_duration(
   const WaypointTrajectory::Knot & a, const WaypointTrajectory::Knot & b,
-  const SmoothingParams & params)
+  const SmoothingParams & params, bool allow_reverse = false)
 {
   const Eigen::Vector3d delta = b.position - a.position;
   const Eigen::Vector3d dir = delta.normalized();
-  const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
   // The true peak can fall between samples, so keep a margin; otherwise the full check in
   // smooth() sees it and slows the corner down for nothing.
   constexpr double kMargin = 0.99;
   const auto fits = [&](double T) {
-      const QuinticHermite seg(a.position, a.velocity, zero, b.position, b.velocity, zero, T);
+      const QuinticHermite seg(
+        a.position, a.velocity, a.acceleration, b.position, b.velocity, b.acceleration, T);
       constexpr int kSamples = 64;
       for (int i = 0; i <= kSamples; ++i) {
         const double u = T * i / kSamples;
         const Eigen::Vector3d v = seg.velocity(u);
         if (v.norm() > params.max_vel * kMargin * (1.0 + 1e-9) ||
           seg.acceleration(u).norm() > params.max_acc * kMargin * (1.0 + 1e-9) ||
-          v.dot(dir) < -1e-9)
+          (!allow_reverse && v.dot(dir) < -1e-9))
         {
           return false;
         }
@@ -81,9 +80,10 @@ double segment_duration(
 
   const double rest = QuinticLine::min_duration(
     delta.norm(), params.max_vel * kMargin, params.max_acc * kMargin);
+  const double longest = 3.0 * rest + 4.0 * a.velocity.norm() / params.max_acc;
   double best = 0.0;
-  for (int i = 0; i <= 120; ++i) {
-    const double T = 3.0 * rest * std::pow(0.95, i);
+  for (int i = 0; i <= 140; ++i) {
+    const double T = longest * std::pow(0.95, i);
     if (fits(T)) {
       best = T;
     } else if (best > 0.0) {
@@ -93,23 +93,149 @@ double segment_duration(
   return best;
 }
 
+// Where a moving start comes to rest when braking straight ahead: the end of the shortest
+// segment from it to rest at p0 + v0 * T / 2 (as if decelerating evenly) that stays within
+// the limits and never moves backwards. Its duration goes to `duration` if given.
+WaypointTrajectory::Knot braking_stop(
+  const WaypointTrajectory::Knot & from, const SmoothingParams & params,
+  double * duration = nullptr)
+{
+  const Eigen::Vector3d dir = from.velocity.normalized();
+  const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
+  for (double T = 0.1; ; T *= 1.05) {
+    const Eigen::Vector3d end = from.position + from.velocity * T / 2.0;
+    const QuinticHermite seg(from.position, from.velocity, from.acceleration, end, zero, zero, T);
+    bool fits = true;
+    constexpr int kSamples = 64;
+    for (int i = 0; i <= kSamples && fits; ++i) {
+      const double u = T * i / kSamples;
+      const Eigen::Vector3d v = seg.velocity(u);
+      fits = v.norm() <= params.max_vel * (1.0 + 1e-9) &&
+        seg.acceleration(u).norm() <= params.max_acc * (1.0 + 1e-9) && v.dot(dir) >= -1e-9;
+    }
+    if (fits) {
+      WaypointTrajectory::Knot stop;
+      stop.position = end;
+      if (duration) {
+        *duration = T;
+      }
+      return stop;
+    }
+  }
+}
+
+// Long straight legs ramp up to cruise speed, cruise, and ramp down, instead of being one
+// quintic (which averages only about half its peak speed). A straight leg is a segment
+// whose end velocities point along it, without acceleration. It gets two extra knots a ramp
+// distance in from each end, moving at cruise speed: the ramps are quintics from one speed
+// to the other along the leg, v = v0 + (v1 - v0) s(t / T) with s the minimum-jerk profile,
+// whose peak acceleration 1.875 (v1 - v0) / T fixes the ramp length; between the two knots
+// the quintic is exactly constant speed. Inserts the knots (owner -1) and shifts
+// corner_knot; returns each segment's exact duration, or 0 where it's left to search.
+std::vector<double> add_cruise(
+  std::vector<WaypointTrajectory::Knot> & knots, std::vector<int> & owner,
+  std::vector<size_t> & corner_knot, const SmoothingParams & params)
+{
+  constexpr double kMargin = 0.99;  // as in segment_duration
+  const double vc = params.max_vel * kMargin, acc = params.max_acc * kMargin;
+  std::vector<WaypointTrajectory::Knot> out_knots;
+  std::vector<int> out_owner;
+  std::vector<size_t> remap(knots.size());
+  std::vector<double> exact;
+  for (size_t j = 0; j < knots.size(); ++j) {
+    remap[j] = out_knots.size();
+    out_knots.push_back(knots[j]);
+    out_owner.push_back(owner[j]);
+    if (j + 1 == knots.size()) {
+      break;
+    }
+    const auto & a = knots[j];
+    const auto & b = knots[j + 1];
+    const Eigen::Vector3d delta = b.position - a.position;
+    const double length = delta.norm();
+    const Eigen::Vector3d dir = delta / std::max(length, 1e-9);
+    const auto along = [&](const Eigen::Vector3d & v) {
+        return (v - v.dot(dir) * dir).norm() < 1e-6 && v.dot(dir) >= -1e-9;
+      };
+    const double va = a.velocity.dot(dir), vb = b.velocity.dot(dir);
+    const double ramp_a = 1.875 * (vc * vc - va * va) / (2.0 * acc);
+    const double ramp_b = 1.875 * (vc * vc - vb * vb) / (2.0 * acc);
+    const bool straight = length > 1e-6 && along(a.velocity) && along(b.velocity) &&
+      a.acceleration.isZero() && b.acceleration.isZero() && va < vc && vb < vc;
+    if (!straight || ramp_a + ramp_b + 0.1 > length) {
+      exact.push_back(0.0);
+      continue;
+    }
+    WaypointTrajectory::Knot in, out;
+    in.position = a.position + ramp_a * dir;
+    in.velocity = vc * dir;
+    out.position = b.position - ramp_b * dir;
+    out.velocity = vc * dir;
+    out_knots.push_back(in);
+    out_owner.push_back(-1);
+    out_knots.push_back(out);
+    out_owner.push_back(-1);
+    exact.push_back(2.0 * ramp_a / (va + vc));
+    exact.push_back((length - ramp_a - ramp_b) / vc);
+    exact.push_back(2.0 * ramp_b / (vb + vc));
+  }
+  for (auto & k : corner_knot) {
+    k = remap[k];
+  }
+  knots = std::move(out_knots);
+  owner = std::move(out_owner);
+  return exact;
+}
+
+// Shortest duration for a yaw turn from (from, rate) to `to` at rest, within the yaw rate
+// and acceleration limits. Same profile as WaypointTrajectory's first turn.
+double first_turn_duration(double from, double rate, double to, const SmoothingParams & params)
+{
+  const double delta = trajectory_server::wrap_angle(to - from);
+  const auto fits = [&](double T) {
+      constexpr int kSamples = 64;
+      for (int i = 0; i <= kSamples; ++i) {
+        const double tau = static_cast<double>(i) / kSamples;
+        const double tau2 = tau * tau, tau3 = tau2 * tau;
+        // Rest-to-rest quintic plus the start-rate basis (see WaypointTrajectory::sample).
+        const double ds = 30.0 * tau2 - 60.0 * tau3 + 30.0 * tau3 * tau;
+        const double dds = 60.0 * tau - 180.0 * tau2 + 120.0 * tau3;
+        const double dh = 1.0 - 18.0 * tau2 + 32.0 * tau3 - 15.0 * tau3 * tau;
+        const double ddh = -36.0 * tau + 96.0 * tau2 - 60.0 * tau3;
+        const double r = delta * ds / T + rate * dh;
+        const double acc = delta * dds / (T * T) + rate * ddh / T;
+        if (std::abs(r) > params.max_yaw_rate * (1.0 + 1e-9) ||
+          std::abs(acc) > params.max_yaw_acc * (1.0 + 1e-9))
+        {
+          return false;
+        }
+      }
+      return true;
+    };
+  double T = std::max(
+    YawTurn::min_duration(from, to, params.max_yaw_rate, params.max_yaw_acc), 0.1);
+  while (!fits(T)) {
+    T *= 1.1;
+  }
+  return T;
+}
+
 }  // namespace
 
 std::vector<Eigen::Vector3d> shortcut(
-  const OccupancyMap & map, const std::vector<Eigen::Vector3d> & path,
+  const DistanceMap & map, const std::vector<Eigen::Vector3d> & path,
   const AStarPlanner::Params & params)
 {
   if (path.size() <= 2) {
     return path;
   }
-  const InflatedMap inflated(map, params.inflation_radius);
   const Key exempt = map.key(path.front());
 
   // Cost of the original path up to each waypoint, measured like the shortcuts.
   std::vector<double> cost_to{0.0};
   for (size_t i = 1; i < path.size(); ++i) {
     cost_to.push_back(
-      cost_to.back() + check_segment(inflated, exempt, path[i - 1], path[i], params).cost);
+      cost_to.back() + check_segment(map, exempt, path[i - 1], path[i], params).cost);
   }
 
   std::vector<Eigen::Vector3d> out{path.front()};
@@ -117,7 +243,7 @@ std::vector<Eigen::Vector3d> shortcut(
   while (i + 1 < path.size()) {
     size_t next = i + 1;
     for (size_t j = path.size() - 1; j > i + 1; --j) {
-      const auto seg = check_segment(inflated, exempt, path[i], path[j], params);
+      const auto seg = check_segment(map, exempt, path[i], path[j], params);
       if (seg.clear && seg.cost <= cost_to[j] - cost_to[i] + 1e-9) {
         next = j;
         break;
@@ -130,9 +256,12 @@ std::vector<Eigen::Vector3d> shortcut(
 }
 
 SmoothingResult smooth(
-  const OccupancyMap & map, const std::vector<Eigen::Vector3d> & waypoints,
-  const SmoothingParams & params)
+  const DistanceMap & map, const std::vector<Eigen::Vector3d> & waypoints,
+  const SmoothingParams & params, const StartState & start)
 {
+  if (map.max_distance() < params.collision_radius - 1e-9) {
+    throw std::invalid_argument("Distance map too short-ranged for collision_radius");
+  }
   SmoothingResult result;
 
   std::vector<Eigen::Vector3d> pts;
@@ -142,6 +271,7 @@ SmoothingResult smooth(
     }
   }
   if (pts.size() < 2) {
+    result.failure = "fewer than two distinct waypoints";
     return result;
   }
   const size_t n = pts.size();
@@ -191,7 +321,24 @@ SmoothingResult smooth(
     c.rounded = c.speed > kMinCornerSpeed;
   }
 
-  const InflatedMap clearance(map, params.collision_radius);
+  // A moving start leads straight into the first segment, unless it's heading away from the
+  // first leg or too fast to make it: then it brakes to a stop straight ahead first. One
+  // quintic can't turn a fast, accelerating start round onto a long leg within the limits.
+  std::optional<WaypointTrajectory::Knot> stop;
+  if (!start.velocity.isZero()) {
+    WaypointTrajectory::Knot from, to;
+    from.position = pts[0];
+    from.velocity = start.velocity;
+    from.acceleration = start.acceleration;
+    const Corner & first = corners[1];
+    to.position = n > 2 && first.rounded ? pts[1] - first.reach * first.in : pts[1];
+    if (start.velocity.dot(pts[1] - pts[0]) < 0.0 ||
+      segment_duration(from, to, params, true) == 0.0)
+    {
+      stop = braking_stop(from, params);
+    }
+  }
+
   const Key exempt = map.key(pts.front());
   const double dt = 0.25 * map.resolution() / params.max_vel;
   std::vector<bool> stopped(n, false);
@@ -207,7 +354,11 @@ SmoothingResult smooth(
         knots.push_back(knot);
         owner.push_back(k);
       };
-    add(pts.front(), Eigen::Vector3d::Zero(), -1);
+    add(pts.front(), start.velocity, -1);
+    knots.front().acceleration = start.acceleration;
+    if (stop) {
+      add(stop->position, Eigen::Vector3d::Zero(), -1);
+    }
     for (size_t k = 1; k + 1 < n; ++k) {
       const Corner & c = corners[k];
       const int id = static_cast<int>(k);
@@ -222,6 +373,8 @@ SmoothingResult smooth(
       }
     }
     add(pts.back(), Eigen::Vector3d::Zero(), -1);
+    // Segments whose duration is known exactly (cruise legs), by index.
+    std::vector<double> exact = add_cruise(knots, owner, corner_knot, params);
     const size_t m = knots.size();
 
     // Corners to slow down this iteration. A set, because a corner owns up to three knots
@@ -247,7 +400,8 @@ SmoothingResult smooth(
     std::vector<double> durations(m - 1);
     bool infeasible = false;
     for (size_t j = 0; j + 1 < m; ++j) {
-      durations[j] = segment_duration(knots[j], knots[j + 1], params);
+      durations[j] = exact[j] > 0.0 ? exact[j] :
+        segment_duration(knots[j], knots[j + 1], params, j == 0);
       if (durations[j] == 0.0) {
         mark_slow(owner[j]);
         mark_slow(owner[j + 1]);
@@ -268,6 +422,15 @@ SmoothingResult smooth(
     }
     std::vector<WaypointTrajectory::Turn> turns;
     double yaw = heading.front(), free_from = 0.0;
+    const double yaw0 = start.yaw.value_or(heading.front());
+    const double yaw_rate0 = start.yaw ? start.yaw_rate : 0.0;
+    const double first_turn = trajectory_server::wrap_angle(heading.front() - yaw0);
+    if (std::abs(first_turn) > 1e-6 || yaw_rate0 != 0.0) {
+      // Face the first leg first, carrying on from the current yaw rate.
+      const double T = first_turn_duration(yaw0, yaw_rate0, heading.front(), params);
+      turns.push_back({0.0, T, heading.front()});
+      free_from = T;
+    }
     for (size_t k = 1; k + 1 < n; ++k) {
       if (std::abs(trajectory_server::wrap_angle(heading[k] - yaw)) < 1e-6) {
         continue;
@@ -279,7 +442,8 @@ SmoothingResult smooth(
       yaw = heading[k];
     }
 
-    auto traj = std::make_shared<const WaypointTrajectory>(knots, durations, heading.front(), turns);
+    auto traj = std::make_shared<const WaypointTrajectory>(
+      knots, durations, yaw0, turns, turns.empty() ? 0.0 : yaw_rate0);
 
     std::vector<bool> too_fast(m - 1, false), collides(m - 1, false);
     size_t seg = 0;
@@ -294,7 +458,7 @@ SmoothingResult smooth(
         too_fast[seg] = true;
       }
       const Key key = map.key(p.position);
-      if (key != exempt && clearance.blocked(key)) {
+      if (key != exempt && map.distance(key) <= params.collision_radius) {
         collides[seg] = true;
       }
       if (t >= traj->duration()) {
@@ -314,7 +478,20 @@ SmoothingResult smooth(
           }
         }
         if (!stopped_any) {
-          return result;  // a straight leg is too close; the map changed under us
+          if (j == 0 && !start.velocity.isZero() && !stop) {
+            // A moving start swings too close while turning onto the first leg: brake to a
+            // stop straight ahead first instead (that part is checked next pass too).
+            WaypointTrajectory::Knot from;
+            from.position = pts[0];
+            from.velocity = start.velocity;
+            from.acceleration = start.acceleration;
+            stop = braking_stop(from, params);
+            changed = true;
+            continue;
+          }
+          // A straight leg is too close: the map changed under us.
+          result.failure = j == 0 ? "first segment collides" : "straight leg collides";
+          return result;
         }
         changed = true;
       } else if (too_fast[j]) {
@@ -329,7 +506,58 @@ SmoothingResult smooth(
       return result;
     }
   }
+  result.failure = "no timing within the limits";
   return result;
+}
+
+std::shared_ptr<const WaypointTrajectory> brake(
+  const Eigen::Vector3d & position, const StartState & start, const SmoothingParams & params)
+{
+  WaypointTrajectory::Knot from;
+  from.position = position;
+  from.velocity = start.velocity;
+  from.acceleration = start.acceleration;
+  WaypointTrajectory::Knot stop;
+  stop.position = position;
+  double T = 0.1;
+  if (!start.velocity.isZero()) {
+    stop = braking_stop(from, params, &T);
+  } else if (!start.acceleration.isZero()) {
+    // At rest but accelerating: settle in place.
+    T = std::sqrt(start.acceleration.norm() / params.max_acc) * 3.0 + 0.1;
+  }
+  const double yaw = start.yaw.value_or(0.0);
+  std::vector<WaypointTrajectory::Turn> turns;
+  if (start.yaw && start.yaw_rate != 0.0) {
+    turns.push_back({0.0, first_turn_duration(yaw, start.yaw_rate, yaw, params), yaw});
+  }
+  return std::make_shared<const WaypointTrajectory>(
+    std::vector<WaypointTrajectory::Knot>{from, stop}, std::vector<double>{T}, yaw, turns,
+    turns.empty() ? 0.0 : start.yaw_rate);
+}
+
+std::optional<double> first_collision(
+  const OccupancyMap & map, const trajectory_server::Trajectory & trajectory, double t0,
+  double radius, double dt)
+{
+  std::vector<std::pair<double, Eigen::Vector3d>> samples;
+  Eigen::AlignedBox3d box;
+  for (double t = std::max(t0, 0.0); ; t = std::min(t + dt, trajectory.duration())) {
+    const Eigen::Vector3d p = trajectory.sample(t).position;
+    samples.emplace_back(t, p);
+    box.extend(p);
+    if (t >= trajectory.duration()) {
+      break;
+    }
+  }
+  // Distances only around the trajectory: cheap enough to check every map update.
+  const DistanceMap distances(map, box, radius);
+  for (const auto & [t, p] : samples) {
+    if (distances.distance(distances.key(p)) <= radius) {
+      return t;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace path_planner

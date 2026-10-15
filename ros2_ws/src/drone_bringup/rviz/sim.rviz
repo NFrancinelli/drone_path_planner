@@ -37,7 +37,7 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/Path
       Name: Planned trajectory
-      Enabled: true
+      Enabled: false
       Color: 255; 140; 0
       Alpha: 1
       Line Style: Billboards
@@ -50,7 +50,7 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Path
       Name: A* path
       Enabled: true
@@ -67,9 +67,23 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Planner
+      Enabled: true
+      Namespaces:
+        goal: true
+        trajectory: true
+        blocked: true
+      Topic:
+        Value: /planner_markers
+        Depth: 10
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Value: true
     - Class: rviz_default_plugins/Path
       Name: Smoothed trajectory
-      Enabled: true
+      Enabled: false
       Color: 0; 190; 255
       Alpha: 1
       Line Style: Billboards
@@ -82,7 +96,7 @@ Visualization Manager:
         Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Path
       Name: Flown trail
       Enabled: true
