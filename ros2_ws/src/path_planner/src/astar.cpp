@@ -20,6 +20,10 @@ struct Step
   Key offset;
   double length;  // in voxels
   double climb;   // |dz| in voxels
+  // The voxels a diagonal step squeezes between (offsets keeping some of its components):
+  // a straight line from anywhere in the voxel to the next one's center can pass through
+  // them, so they must be clear too.
+  std::vector<Key> squeezed;
 };
 
 std::vector<Step> make_neighbours()
@@ -29,8 +33,18 @@ std::vector<Step> make_neighbours()
     for (int dy = -1; dy <= 1; ++dy) {
       for (int dz = -1; dz <= 1; ++dz) {
         if (dx != 0 || dy != 0 || dz != 0) {
-          steps.push_back(
-            {Key(dx, dy, dz), std::sqrt(double(dx * dx + dy * dy + dz * dz)), double(std::abs(dz))});
+          const Key offset(dx, dy, dz);
+          Step step{offset, std::sqrt(double(dx * dx + dy * dy + dz * dz)), double(std::abs(dz)),
+            {}};
+          for (int mask = 1; mask < 7; ++mask) {  // proper, non-empty subsets of the axes
+            const Key q(mask & 1 ? dx : 0, mask & 2 ? dy : 0, mask & 4 ? dz : 0);
+            if (q != Key::Zero() && q != offset &&
+              std::find(step.squeezed.begin(), step.squeezed.end(), q) == step.squeezed.end())
+            {
+              step.squeezed.push_back(q);
+            }
+          }
+          steps.push_back(step);
         }
       }
     }
@@ -70,6 +84,13 @@ double step_weight(const AStarPlanner::Params & params, const DistanceMap & map,
     weight += params.clearance_cost * std::clamp(closeness, 0.0, 1.0);
   }
   return weight;
+}
+
+bool unseen_near(
+  const OccupancyMap & map, const Key & k, const Eigen::Vector3d & start, double radius)
+{
+  return radius > 0.0 && (map.center(k) - start).norm() <= radius && k != map.key(start) &&
+         map.at(k) == Occupancy::Unknown;
 }
 
 AStarPlanner::Result AStarPlanner::plan(
@@ -161,7 +182,18 @@ AStarPlanner::Result AStarPlanner::plan(
         continue;  // also keeps index() inside the grid, which covers the bounds
       }
       const long j = map.index(next);
-      if (closed[j] || blocked(next)) {
+      // The voxel stepped into, and every voxel the step squeezes past (no cutting corners),
+      // must be clear; from a blocked start (the drone stopped too close to a wall), at least
+      // farther from it. Near the start they must also have been seen.
+      const double here = map.distance(node.key);
+      const auto passable = [&](const Key & k) {
+          return (!blocked(k) || map.distance(k) > here) &&
+                 !unseen_near(map, k, start, p_.known_radius);
+        };
+      if (closed[j] || !passable(next) ||
+        !std::all_of(step.squeezed.begin(), step.squeezed.end(),
+        [&](const Key & q) {return passable(node.key + q);}))
+      {
         continue;
       }
       const double weight = step_weight(p_, map, next);

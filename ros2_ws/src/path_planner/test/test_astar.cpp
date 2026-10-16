@@ -110,6 +110,52 @@ TEST(AStar, CanLeaveStartInsideInflation)
   EXPECT_GT(min_clearance(map, result.path), params.inflation_radius);
 }
 
+TEST(AStar, LeavesStartDeepInsideInflation)
+{
+  // Two voxels deep into the inflation, the first step away is still blocked: it may be
+  // taken because it moves away from the wall, but not along it.
+  TestMap map(Occupancy::Free);
+  map.set_box({0.6, -10.0, 0.0}, {0.6, 10.0, 3.0}, Occupancy::Occupied);  // x = 0.5..0.75
+  AStarPlanner::Params params;
+  params.inflation_radius = 0.6;
+  params.bounds = flat_bounds(-3.0, -2.0, 3.0, 2.0);
+  const Eigen::Vector3d start(0.375, 0.125, kLayerZ);  // 0.25 m from the wall
+  const auto result = AStarPlanner(params).plan(map, start, {-2.125, 0.125, kLayerZ});
+  ASSERT_EQ(result.status, Status::Success);
+  ASSERT_GE(result.path.size(), 3u);
+  EXPECT_LT(result.path[1].x(), start.x());
+
+  // In a corridor too narrow to get clear in, moving away from one wall moves closer to the
+  // other, and along it stays as close: no way out.
+  map.set_box({-3.0, -1.0, 0.0}, {-0.1, 1.0, 3.0}, Occupancy::Occupied);  // x < 0, |y| < 1
+  EXPECT_EQ(AStarPlanner(params).plan(map, start, {-2.125, 1.875, kLayerZ}).status,
+    Status::NoPath);
+}
+
+TEST(AStar, DoesNotCutCorners)
+{
+  // An obstacle whose inflation just covers the voxel at the inside of a corner: the path
+  // goes round it through clear voxels, not diagonally past it.
+  TestMap map(Occupancy::Free);
+  map.set_box({1.1, 1.1, 0.0}, {1.1, 1.1, 3.0}, Occupancy::Occupied);  // voxel x, y = 1..1.25
+  AStarPlanner::Params params;
+  params.inflation_radius = 0.3;  // blocks the obstacle's 4 face neighbours, not diagonals
+  params.clearance_cost = 0.0;
+  params.bounds = flat_bounds(-1.0, -1.0, 3.0, 3.0);
+  const auto result = AStarPlanner(params).plan(
+    map, {0.625, 0.625, kLayerZ}, {1.625, 1.625, kLayerZ});  // diagonal across the obstacle
+  ASSERT_EQ(result.status, Status::Success);
+  for (size_t i = 0; i + 1 < result.path.size(); ++i) {
+    // Every voxel a step passes next to is clear.
+    const Key a = map.key(result.path[i]), b = map.key(result.path[i + 1]);
+    for (const Key & q : {Key(b.x(), a.y(), a.z()), Key(a.x(), b.y(), a.z())}) {
+      const Eigen::Vector3d c = map.center(q);
+      EXPECT_GT((c - Eigen::Vector3d(1.125, 1.125, c.z())).norm(), params.inflation_radius)
+        << "step " << i << " cuts past (" << c.x() << ", " << c.y() << ")";
+    }
+  }
+}
+
 TEST(AStar, UnknownCostTradesDistanceForKnownSpace)
 {
   // Unknown map with a U-shaped free corridor: 4 m straight through unknown vs ~8 m
@@ -135,6 +181,43 @@ TEST(AStar, UnknownCostTradesDistanceForKnownSpace)
     EXPECT_EQ(map.at(map.key(detour.path[i])), Occupancy::Free) << "waypoint " << i;
   }
   EXPECT_LT(detour.cost, 8.0);
+}
+
+TEST(AStar, KnownRadiusKeepsUnseenSpaceAwayFromTheStart)
+{
+  // The U-shaped corridor again, free to cross at unknown_cost 0, but not near the start.
+  TestMap map(Occupancy::Unknown);
+  map.set_box({0.1, 0.1, kLayerZ}, {0.1, 2.1, kLayerZ}, Occupancy::Free);
+  map.set_box({0.1, 2.1, kLayerZ}, {4.1, 2.1, kLayerZ}, Occupancy::Free);
+  map.set_box({4.1, 0.1, kLayerZ}, {4.1, 2.1, kLayerZ}, Occupancy::Free);
+  const Eigen::Vector3d start(0.125, 0.125, kLayerZ), goal(4.125, 0.125, kLayerZ);
+  AStarPlanner::Params params;
+  params.unknown_cost = 0.0;
+  params.known_radius = 1.0;
+  params.bounds = flat_bounds(-1.0, -1.0, 5.0, 3.0);
+
+  const auto result = AStarPlanner(params).plan(map, start, goal);
+  ASSERT_EQ(result.status, Status::Success);
+  EXPECT_GT(result.cost, 4.5);  // not straight across
+  bool crossed = false;
+  for (size_t i = 1; i + 1 < result.path.size(); ++i) {
+    const auto & p = result.path[i];
+    const bool unknown = map.at(map.key(p)) == Occupancy::Unknown;
+    if ((p - start).norm() <= params.known_radius) {
+      EXPECT_FALSE(unknown) << p.transpose();
+    }
+    crossed = crossed || unknown;
+  }
+  EXPECT_TRUE(crossed);  // still cuts across farther away
+
+  // Its own voxel doesn't count: the drone may be where the camera hasn't looked.
+  TestMap open(Occupancy::Free);
+  open.set_box(start, start, Occupancy::Unknown);
+  EXPECT_EQ(AStarPlanner(params).plan(open, start, goal).status, Status::Success);
+  // Nothing seen around it: no way out.
+  TestMap blind(Occupancy::Free);
+  blind.set_box({-0.5, -0.5, kLayerZ}, {0.75, 0.75, kLayerZ}, Occupancy::Unknown);
+  EXPECT_EQ(AStarPlanner(params).plan(blind, start, goal).status, Status::NoPath);
 }
 
 TEST(AStar, VerticalCostKeepsAltitude)

@@ -15,9 +15,11 @@ namespace path_planner
 
 // Greedy shortcut of an A* path: from each kept waypoint, jump to the farthest later one
 // whose straight segment is clear of the inflated map and costs no more than the path it
-// replaces (same inflation and cost weighting as the A* params, so it never cuts through
-// unknown space the planner went around, or closer to obstacles than it went). The start
-// voxel is exempt from the clearance check, as in A*.
+// replaces, give or take shortcut_slack (same inflation and cost weighting as the A* params,
+// so it never cuts through unknown space the planner went around, or closer to obstacles
+// than it went). A blocked
+// start may only move away until it's clear, and unknown space within known_radius of the
+// start is blocked, as in A*.
 std::vector<Eigen::Vector3d> shortcut(
   const DistanceMap & map, const std::vector<Eigen::Vector3d> & path,
   const AStarPlanner::Params & params);
@@ -30,6 +32,7 @@ struct SmoothingParams
   double max_yaw_acc{1.0};       // [rad/s^2]
   double collision_radius{0.45};  // [m] clearance on the uninflated map, <= inflation radius
   double corner_distance{0.75};  // [m] how far before and after a corner the turn starts
+  double known_radius{0.0};      // [m] as AStarPlanner::Params::known_radius
 };
 
 // State a trajectory starts in: at rest by default, or the state of the trajectory being
@@ -55,8 +58,9 @@ struct SmoothingResult
 // corner, where it rounds the turn at a speed set by the turn angle. Each segment gets the
 // shortest duration that respects the limits.
 // The result is sampled against the map with collision_radius: a corner whose rounding
-// comes too close to an obstacle is replaced by a stop, which leaves only the straight
-// legs the shortcut already checked. Corners over the vel/acc limits are slowed down.
+// comes too close to an obstacle, or cuts into unknown space within known_radius of the
+// start, is replaced by a stop, which leaves only the straight legs the shortcut already
+// checked. Corners over the vel/acc limits are slowed down.
 // Yaw starts facing the first leg and turns to face each next leg by the time the drone
 // reaches its corner (or as soon as possible after, when corners are close); climbs keep
 // the heading. From rest, the caller turns the drone to the first leg's heading beforehand;
@@ -74,8 +78,18 @@ std::shared_ptr<const trajectory_server::WaypointTrajectory> brake(
   const Eigen::Vector3d & position, const StartState & start, const SmoothingParams & params);
 
 // Time of the first sample of `trajectory` from t0 on (sampled every dt) closer than
-// `radius` to an occupied voxel of `map`, if any.
+// `radius` to an occupied voxel of `map`, if any. One that starts closer only counts once
+// it gets closer still before getting clear: a drone stopped near a wall, or leaving it,
+// isn't running into it.
 std::optional<double> first_collision(
+  const OccupancyMap & map, const trajectory_server::Trajectory & trajectory, double t0,
+  double radius, double dt = 0.05);
+
+// Time of the first sample of `trajectory` from t0 on (sampled every dt) in unknown space
+// within `radius` of where it is at t0 (unseen_near), if any; it stops looking once the
+// trajectory has left that radius. I.e. whether the trajectory from t0 on would still pass
+// as a new plan starting there.
+std::optional<double> first_unseen(
   const OccupancyMap & map, const trajectory_server::Trajectory & trajectory, double t0,
   double radius, double dt = 0.05);
 

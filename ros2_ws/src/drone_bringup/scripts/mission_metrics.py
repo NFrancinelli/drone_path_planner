@@ -11,7 +11,8 @@ frame, from TF. Obstacles are the static boxes of the world's SDF (no rotations,
 worlds), and clearance is measured from the drone's center to their surfaces; below the
 drone's radius it touched.
 
---csv appends one row per run (with a header for a new file), for the benchmark table.
+--csv appends one row per run (with a header for a new file), for the benchmark table;
+--trail writes the flown positions (t, x, y, z) to a CSV file, for plotting the route.
 Needs a sim running with use_sim_time; run it with use_sim_time too (the default here).
 """
 
@@ -72,6 +73,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=180.0, help="[s] of wall time")
     parser.add_argument("--csv", help="append the result to this CSV file")
     parser.add_argument("--label", default="", help="free text for the CSV row")
+    parser.add_argument("--trail", help="write the flown positions to this CSV file")
     parser.add_argument("--frame", default="odom")
     parser.add_argument("--body-frame", default="base_link")
     args = parser.parse_args()
@@ -122,6 +124,7 @@ def main():
     min_clear = (math.inf, None)
     last = position()
     last_time = start_time
+    trail = [(0.0, *last)]
     reached = False
     while time.time() - wall_start < args.timeout:
         rclpy.spin_once(node, timeout_sec=0.02)
@@ -137,6 +140,7 @@ def main():
         max_speed = max(max_speed, step / dt)
         max_z = max(max_z, p[2])
         min_clear = min(min_clear, clearance(p, boxes))
+        trail.append(((now - start_time).nanoseconds * 1e-9, *p))
         last, last_time = p, now
 
     flight_time = (node.get_clock().now() - start_time).nanoseconds * 1e-9
@@ -170,6 +174,12 @@ def main():
                 writer.writeheader()
             writer.writerow(row)
         print(f"appended to {args.csv}")
+    if args.trail:
+        with open(args.trail, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["t", "x", "y", "z"])
+            writer.writerows([round(v, 3) for v in row] for row in trail)
+        print(f"trail written to {args.trail}")
     rclpy.shutdown()
     return 0 if reached and not touched else 1
 
