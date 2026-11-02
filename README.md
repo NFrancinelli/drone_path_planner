@@ -6,6 +6,8 @@ Simulation, flight control and mapping are off-the-shelf (Gazebo Harmonic, PX4 S
 
 Project page: https://nfrancinelli.github.io/projects/3d-planner/
 
+Demo video (86 s): https://github.com/NFrancinelli/drone_path_planner/releases/download/Milestone_5/demo.mp4
+
 ## Status
 
 - [x] Milestone 1 – infrastructure: Docker stack, PX4 offboard control, trajectory server flying a figure-eight
@@ -18,9 +20,9 @@ Project page: https://nfrancinelli.github.io/projects/3d-planner/
   - [x] `factory` world: 1.5 m gaps, a corridor dead-ending at a crate wall
   - [x] New plans take over a trajectory in flight without a jump
   - [x] Replanning when the path gets blocked, switching to clearly shorter ways, braking when stuck
-- [ ] Milestone 5 – unknown-cost comparison + demo video
+- [x] Milestone 5 – unknown-cost comparison + demo video
   - [x] Unknown-cost comparison (see Unknown-space cost)
-  - [ ] Demo video
+  - [x] Demo video (see the `Milestone_5` release)
 
 ## Quick start
 
