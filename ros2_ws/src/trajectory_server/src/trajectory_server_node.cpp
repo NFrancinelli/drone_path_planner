@@ -163,8 +163,9 @@ private:
         if (offboard() && armed()) {
           const Eigen::Vector3d start = current_position();
           const Eigen::Vector3d top(start.x(), start.y(), takeoff_altitude_);
-          follow(std::make_shared<QuinticLine>(start, top, hold_point_.yaw,
-            QuinticLine::min_duration((top - start).norm(), max_vel_, max_acc_)), now());
+          climb_duration_ = QuinticLine::min_duration((top - start).norm(), max_vel_, max_acc_);
+          follow(std::make_shared<QuinticLine>(start, top, hold_point_.yaw, climb_duration_),
+            now());
           transition(State::Takeoff);
         } else if (t - last_command_time_ > 1.0) {
           // Re-send until PX4 accepts; commands are fire-and-forget over DDS.
@@ -178,8 +179,18 @@ private:
         break;
 
       case State::Takeoff:
+        // Hover only once PX4 has really climbed: it can arm, report the takeoff and still
+        // stay on the ground, and the planner can't plan from there.
         if (trajectory_finished()) {
-          transition(State::Hover);
+          const double height = current_position().z();
+          if (std::abs(height - takeoff_altitude_) < kTakeoffTolerance) {
+            transition(State::Hover);
+          } else if (elapsed() > climb_duration_ + kTakeoffTimeout) {
+            RCLCPP_ERROR(get_logger(), "Takeoff failed: at %.2f m %.0f s after the climb "
+              "(takeoff altitude %.2f m), landing", height, kTakeoffTimeout, takeoff_altitude_);
+            send_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
+            transition(State::Landing);
+          }
         }
         break;
 
@@ -535,6 +546,9 @@ private:
 
   double elapsed() const {return (now() - state_entered_).seconds();}
 
+  static constexpr double kTakeoffTolerance = 0.5;  // [m] from takeoff_altitude to hover
+  static constexpr double kTakeoffTimeout = 10.0;  // [s] after the climb before giving up
+
   // Parameters
   double rate_hz_, takeoff_altitude_, max_vel_, max_acc_, prestream_time_, hover_time_;
   double max_yaw_rate_, max_yaw_acc_, max_start_error_;
@@ -559,6 +573,7 @@ private:
   State state_{State::WaitForPx4};
   rclcpp::Time state_entered_{now()};
   double last_command_time_{-std::numeric_limits<double>::infinity()};
+  double climb_duration_{0.0};  // [s] of the takeoff climb (Takeoff)
   TrajectoryPtr trajectory_;
   rclcpp::Time trajectory_start_{now()};
   TrajectoryPtr pending_;  // flown after the turn (Turn)

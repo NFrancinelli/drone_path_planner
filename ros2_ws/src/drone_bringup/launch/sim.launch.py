@@ -57,7 +57,9 @@ MOCAP_PX4_PARAMS = {
 # space outside the walls costs A* most of its expansions while the hall is unexplored: with
 # a high unknown_cost it runs out of them before reaching the goal.
 FACTORY_BOUNDS = {"bounds_min": [-3.2, -9.2, 1.0], "bounds_max": [21.7, 9.2, 4.0]}
-PLANNER_BOUNDS = {"factory": FACTORY_BOUNDS, "factory_blocked": FACTORY_BOUNDS}
+PLANNER_BOUNDS = {
+    "factory": FACTORY_BOUNDS, "factory_blocked": FACTORY_BOUNDS, "factory_detour": FACTORY_BOUNDS,
+}
 
 
 def generate_launch_description():

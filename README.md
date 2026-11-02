@@ -52,7 +52,10 @@ Run `docker/run.sh` again from another terminal to attach a second shell to the 
 
 ## Flying to a goal
 
-Launch the sim: the drone takes off and hovers. Then use **2D Goal Pose**
+Launch the sim: the drone takes off and hovers (if PX4 hasn't climbed to within 0.5 m of
+the takeoff altitude 10 s after the climb, the trajectory server logs "Takeoff failed" and
+lands; PX4 occasionally arms, reports the takeoff and stays on the ground). Then use
+**2D Goal Pose**
 in the RViz toolbar to click a goal (flown at `goal_altitude`, 2.5 m by default). The planner
 plans from the drone's current position on the latest OctoMap and shows:
 
@@ -189,12 +192,12 @@ To debug a plan, launch with `dump_dir:=/ws/dumps` (the directory must exist): t
 saves every plan's map and inputs, and
 
 ```bash
-ros2 run path_planner plan_replay /ws/dumps/plan_0012 [start=x,y,z] [unknown_cost=2] ...
+ros2 run path_planner plan_replay /ws/dumps/plan_0012 [start=x,y,z] [goal=x,y,z] [unknown_cost=2] ...
 ```
 
 replays it offline through A*, the shortcut and smoothing, printing each step's waypoints
-and clearances, optionally from another start or with other parameters; `samples=<file>`
-also writes the smoothed trajectory as CSV.
+and clearances, optionally from another start, to another goal or with other parameters;
+`samples=<file>` also writes the smoothed trajectory as CSV.
 
 ## Unknown-space cost
 
@@ -253,8 +256,8 @@ The aisle is the shorter way on the map, so 0 and 1 try it, find the blocker onc
 within the camera's range, and turn back. Then they differ: 0 still prefers unseen space and
 goes round by the south aisle, which happens to be open; 1 now finds the known corridor
 cheaper. 10 never leaves known space and arrives in less than half the time. So a high cost
-wins when the unknown turns out blocked and loses little when it doesn't (the open hall
-above): it pays to trust what has been seen.
+wins when the unknown turns out blocked, and loses little when it doesn't in this hall (above)
+— but only because here the unseen way is barely shorter (below).
 
 This benchmark is what found the known-space rule's reason to exist. Before it, in 4 of 6
 cost-0 runs the return leg grazed or hit `block_south`: plans turned from the aisle along
@@ -263,6 +266,39 @@ testing the rule then caught the planner freezing mid-flight (in 1 of 9 runs, an
 earlier crash with the same signature): braking from a drone still speeding up searched
 forever for a duration that fit, and the drone flew its last trajectory blind into the crate
 wall. Braking now accounts for the starting acceleration, and every such search is bounded.
+
+### When the gamble pays: a hidden shortcut
+
+In `factory`, no return goal makes the unseen way much shorter. Replaying the first plan of
+leg 2 (`plan_replay ... goal=`) to goals along the north aisle, the short way at low cost
+always ran through the inside of `block_north`: 5 m shelving whose inside and top the camera
+never sees, so the map has it as unknown. The drone finds the face and slides round it, and
+the aisle it ends up flying is about as long as the corridor it knows.
+
+`factory_detour` is the empty hall cut by a 5 m divider at x = 10, with a wide door at its
+north end, which the camera sees on the way out, and a 1.8 m door at its south end, which
+it never does. Leg 1 goes from the start to (19.5, 0), round the north end at every value;
+leg 2 back to (6, −7.5), either the way the drone came (through the north door, ~27 m) or
+through the unseen part of the divider (the south door, ~17 m). Replaying leg 2's first
+plan, the planner switches to the known way between 3 and 5. 3 runs per value
+(`docs/benchmark_detour/`); leg 2:
+
+| `unknown_cost` | Leg 2 route | Leg 2 time | Distance | Blocked replans |
+|---|---|---|---|---|
+| 0 | through the south door | 26.2 s (26.0–26.4) | 17.2 m | 3.7 |
+| 1 (default) | through the south door | 26.3 s (26.2–26.3) | 17.2 m | 10.7 |
+| 10 | back through the north door | 40.9 s (38.3–46.0) | 26.6 m | 0.3 |
+
+All 18 legs reached the goal, at least 0.45 m from any obstacle; leg 1 took 29–35 s.
+
+![Routes in the divided hall, from above](docs/benchmark_detour/routes.png)
+
+0 and 1 plan through the divider where it hasn't been seen, find its face as they close in
+(the blocked replans), follow it south and find the door; 10 flies back the way it knows and
+takes half as long again. Together with the blocked aisle, the cost is a bet whose outcome
+depends on the hall, not a setting to maximise: against the default, 10 won by 27 s when
+the unseen way was a dead end and lost by 15 s when it was a shortcut. 1 stays the default: it takes the shortcut
+here, and in the blocked hall it turns back to the known corridor once the dead end is seen.
 
 ## Localization
 
@@ -289,7 +325,7 @@ ground truth during the figure-eight (`world:=boxes figure_eight:=true`), its he
 | `ros2_ws/src/drone_interfaces` | Planner → trajectory server message (`WaypointTrajectory`) |
 | `ros2_ws/src/path_planner` | Planner node on the live OctoMap; ROS-free core with unit tests: A* with obstacle inflation and a cost for unknown space, path shortcutting, trajectory smoothing; `plan_replay` to debug a dumped plan offline |
 | `ros2_ws/src/px4_state_bridge` | PX4 odometry → `/odom`, TF, flown trail, drone model for RViz; `mocap_bridge` feeds ground truth to PX4 as external vision |
-| `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world, `factory` hall (1.5 m gaps, a corridor dead-ending at a crate wall), `factory_blocked` (the same hall with its north aisle closed) |
+| `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world, `factory` hall (1.5 m gaps, a corridor dead-ending at a crate wall), `factory_blocked` (the same hall with its north aisle closed), `factory_detour` (the empty hall cut by a divider with a door at each end) |
 | `ros2_ws/src/drone_bringup` | Launch files, RViz config, `no_return_rays.py` (the camera's no-return pixels as rays OctoMap clears), `mission_metrics.py` (fly to a goal, measure the flight) and `plot_routes.py` (draw flown routes) |
 
 ## Conventions

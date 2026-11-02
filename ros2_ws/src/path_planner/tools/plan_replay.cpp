@@ -5,7 +5,7 @@
 //
 // reads plan_0012.bt (the OctoMap) and plan_0012.txt (start, goal, parameters, sticky
 // voxels). Optional overrides after the name: unknown_cost=<v>, collision_radius=<v>, ...,
-// start=<x>,<y>,<z> (from rest), samples=<file> (writes the smoothed trajectory as t,x,y,z,
+// start=<x>,<y>,<z> (from rest), goal=<x>,<y>,<z>, samples=<file> (writes the smoothed trajectory as t,x,y,z,
 // map clearance CSV every 0.05 s).
 
 #include <cstdio>
@@ -50,6 +50,12 @@ bool override_param(PlanInput & in, std::string & samples, const std::string & a
     }
     in.start = p;
     in.start_state = StartState{};
+  } else if (name == "goal") {
+    if (std::sscanf(arg.c_str() + eq + 1, "%lf,%lf,%lf", &in.goal.x(), &in.goal.y(),
+      &in.goal.z()) != 3)
+    {
+      return false;
+    }
   } else if (name == "unknown_cost") {
     in.astar.unknown_cost = value;
   } else if (name == "inflation_radius") {
