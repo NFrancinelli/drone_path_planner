@@ -36,7 +36,12 @@ target_link_libraries(planner_node planner_core ${OCTOMAP_LIBRARIES})
 ament_target_dependencies(planner_node
   rclcpp geometry_msgs nav_msgs octomap_msgs tf2_ros drone_interfaces visualization_msgs)
 
-install(TARGETS planner_node DESTINATION lib/${PROJECT_NAME})
+# Offline replay of plans the node dumped (dump_dir parameter), for debugging.
+add_executable(plan_replay tools/plan_replay.cpp)
+target_include_directories(plan_replay PRIVATE ${OCTOMAP_INCLUDE_DIRS})
+target_link_libraries(plan_replay planner_core ${OCTOMAP_LIBRARIES})
+
+install(TARGETS planner_node plan_replay DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

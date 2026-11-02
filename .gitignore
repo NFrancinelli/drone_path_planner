@@ -1,3 +1,6 @@
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+__pycache__/
+# Demo video takes and cuts (published as a release asset, not in git)
+tools/video/out/

@@ -3,6 +3,7 @@
     ros2 launch drone_bringup sim.launch.py               # headless Gazebo, RViz
     ros2 launch drone_bringup sim.launch.py gui:=true     # also open the (heavy) Gazebo GUI
     ros2 launch drone_bringup sim.launch.py rviz:=false   # nothing on screen (CI, benchmarks)
+    ros2 launch drone_bringup sim.launch.py unknown_cost:=0   # planner treats unknown as free
 
 Startup order: Gazebo world -> spawn our drone -> PX4 attaches to it (standalone mode).
 Everything on the ROS side runs on simulation time from Gazebo's /clock.
@@ -52,6 +53,14 @@ MOCAP_PX4_PARAMS = {
     "EKF2_EVA_NOISE": "0.05",
 }
 
+# Planner search volume per world, inside its walls (default: +-20 m). Searching the unknown
+# space outside the walls costs A* most of its expansions while the hall is unexplored: with
+# a high unknown_cost it runs out of them before reaching the goal.
+FACTORY_BOUNDS = {"bounds_min": [-3.2, -9.2, 1.0], "bounds_max": [21.7, 9.2, 4.0]}
+PLANNER_BOUNDS = {
+    "factory": FACTORY_BOUNDS, "factory_blocked": FACTORY_BOUNDS, "factory_detour": FACTORY_BOUNDS,
+}
+
 
 def generate_launch_description():
     world = LaunchConfiguration("world")
@@ -84,15 +93,21 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("gui")),
     )
 
+    # Below 1, the sim runs slower than the wall clock. Everything follows sim time, so flights
+    # are the same, but a loaded host can keep up: at 1, with every core busy, PX4 can miss
+    # IMU samples ("Accel #0 fail: TIMEOUT"), lose its height estimate and drop to the floor.
     model_sdf = os.path.join(sim_share, "models", MODEL, "model.sdf")
     spawn = ExecuteProcess(
         cmd=["bash", "-c",
              "for i in $(seq 60); do gz service -i --service /world/$0/scene/info 2>&1 "
              "| grep -q 'Service providers' && break; sleep 1; done; "
+             "gz service -s /world/$0/set_physics --reqtype gz.msgs.Physics "
+             "--reptype gz.msgs.Boolean --timeout 5000 "
+             "--req \"max_step_size: 0.004, real_time_factor: $3\" && "
              "gz service -s /world/$0/create --reqtype gz.msgs.EntityFactory "
              "--reptype gz.msgs.Boolean --timeout 5000 "
              "--req \"sdf_filename: '$1', name: '$2', allow_renaming: false\"",
-             world, model_sdf, MODEL_INSTANCE],
+             world, model_sdf, MODEL_INSTANCE, LaunchConfiguration("real_time_factor")],
         name="spawn_drone",
         output="screen",
     )
@@ -183,6 +198,16 @@ def generate_launch_description():
         condition=LaunchConfigurationEquals("localization", "mocap"),
     )
 
+    # No-return pixels (nothing within the far clip) as rays for OctoMap to clear: see the script.
+    no_return = Node(
+        package="drone_bringup",
+        executable="no_return_rays.py",
+        name="no_return_rays",
+        remappings=[("cloud_in", "/camera/points"), ("cloud_out", "/camera/points_cleared")],
+        parameters=[sim_time],
+        output="log",
+    )
+
     octomap = Node(
         package="octomap_server",
         executable="octomap_server_node",
@@ -191,6 +216,7 @@ def generate_launch_description():
             "frame_id": "odom",
             "base_frame_id": "base_link",
             "resolution": LaunchConfiguration("map_resolution"),
+            # The camera's far clip. no_return_rays puts its points just past it.
             "sensor_model.max_range": 10.0,
             # Only affects the RViz markers: hides the floor (~90% of the cubes) but keeps it in
             # the octree for the planner. Checked against the voxel extent, so it has to be
@@ -199,17 +225,21 @@ def generate_launch_description():
             # Free-space markers for debugging. Only read at startup.
             "publish_free_space": LaunchConfiguration("show_free_space"),
         }],
-        remappings=[("cloud_in", "/camera/points")],
+        remappings=[("cloud_in", "/camera/points_cleared")],
         output="log",
     )
 
-    planner = Node(
-        package="path_planner",
-        executable="planner_node",
-        name="path_planner",
-        parameters=[sim_time],
-        output="screen",
-    )
+    def make_planner(context):
+        params = {"unknown_cost": float(LaunchConfiguration("unknown_cost").perform(context)),
+                  "dump_dir": LaunchConfiguration("dump_dir").perform(context)}
+        params.update(PLANNER_BOUNDS.get(world.perform(context), {}))
+        return [Node(
+            package="path_planner",
+            executable="planner_node",
+            name="path_planner",
+            parameters=[sim_time, params],
+            output="screen",
+        )]
 
     rviz = Node(
         package="rviz2",
@@ -241,6 +271,13 @@ def generate_launch_description():
         DeclareLaunchArgument("map_resolution", default_value="0.2", description="OctoMap voxel size [m]"),
         DeclareLaunchArgument("show_free_space", default_value="false",
                               description="publish OctoMap free voxels on /free_cells_vis_array"),
+        DeclareLaunchArgument("unknown_cost", default_value="1.0",
+                              description="planner's extra cost per metre through unknown space"),
+        DeclareLaunchArgument("dump_dir", default_value="",
+                              description="save every plan's inputs here, for plan_replay"),
+        DeclareLaunchArgument("real_time_factor", default_value="1.0",
+                              description="sim speed relative to the wall clock; lower it on a "
+                                          "loaded host (see spawn)"),
         DeclareLaunchArgument("localization", default_value="mocap", choices=["mocap", "gps"],
                               description="mocap: ground truth fed to PX4; gps: PX4's own estimate"),
         *gz_env,
@@ -252,8 +289,9 @@ def generate_launch_description():
         camera_tf,
         state_bridge,
         mocap,
+        no_return,
         octomap,
-        planner,
+        OpaqueFunction(function=make_planner),
         rviz,
         # PX4 needs the drone to exist before it can attach to it.
         RegisterEventHandler(OnProcessExit(target_action=spawn, on_exit=[

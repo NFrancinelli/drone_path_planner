@@ -9,6 +9,12 @@
 //     plans again every improve_period as the map grows;
 //   - if the flown trajectory comes within emergency_radius of an obstacle sooner than a
 //     new plan could take over, the drone brakes at once.
+// The drone only flies where it can stop in space it has seen: plans may not enter unknown
+// space within known_radius of their start (the camera sees nothing beside or below the
+// drone, so a wall there shows up too late to stop), and the check treats a trajectory that
+// would enter it within known_radius of the takeover point as blocked. From rest, a plan
+// that only fails this way is still sent: the server turns the drone to face the first leg
+// before starting it, which puts it in view.
 // Every voxel ever seen occupied stays an obstacle (StickyMap): the worlds are static, and
 // OctoMap can open holes in thin walls.
 //
@@ -27,6 +33,7 @@
 #include <chrono>
 #include <deque>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -47,6 +54,7 @@
 
 #include "path_planner/astar.hpp"
 #include "path_planner/octomap_map.hpp"
+#include "path_planner/plan_dump.hpp"
 #include "path_planner/smoothing.hpp"
 #include "path_planner/sticky_map.hpp"
 #include "trajectory_server/msg_conversions.hpp"
@@ -110,6 +118,8 @@ public:
     emergency_radius_ = declare_parameter("emergency_radius", 0.4);
     improve_min_gain_ = declare_parameter("improve_min_gain", 1.0);
     improve_min_ratio_ = declare_parameter("improve_min_ratio", 0.1);
+    // Debugging: save every plan's inputs here, to replay it with plan_replay. Empty: off.
+    dump_dir_ = declare_parameter("dump_dir", std::string());
 
     AStarPlanner::Params params;
     params.inflation_radius = declare_parameter("inflation_radius", params.inflation_radius);
@@ -117,9 +127,14 @@ public:
     params.vertical_cost = declare_parameter("vertical_cost", params.vertical_cost);
     params.clearance_radius = declare_parameter("clearance_radius", params.clearance_radius);
     params.clearance_cost = declare_parameter("clearance_cost", params.clearance_cost);
+    // Measured from the takeover point, replan_lead ahead: the two together must cover the
+    // stopping distance (logged below).
+    params.known_radius = declare_parameter("known_radius", 1.5);
+    params.shortcut_slack = declare_parameter("shortcut_slack", params.shortcut_slack);
     params.max_expansions =
       static_cast<int>(declare_parameter("max_expansions", params.max_expansions));
-    const auto lo = declare_parameter("bounds_min", std::vector<double>{-20.0, -20.0, 0.5});
+    // The bottom is the floor clearance: the forward camera never sees the floor.
+    const auto lo = declare_parameter("bounds_min", std::vector<double>{-20.0, -20.0, 1.0});
     const auto hi = declare_parameter("bounds_max", std::vector<double>{20.0, 20.0, 4.0});
     params.bounds = Eigen::AlignedBox3d(
       Eigen::Vector3d(lo.at(0), lo.at(1), lo.at(2)), Eigen::Vector3d(hi.at(0), hi.at(1), hi.at(2)));
@@ -131,6 +146,7 @@ public:
     smoothing_.max_yaw_acc = declare_parameter("max_yaw_acc", smoothing_.max_yaw_acc);
     smoothing_.collision_radius = declare_parameter("collision_radius", smoothing_.collision_radius);
     smoothing_.corner_distance = declare_parameter("corner_distance", smoothing_.corner_distance);
+    smoothing_.known_radius = params.known_radius;
     if (smoothing_.collision_radius > params.inflation_radius) {
       throw std::invalid_argument("collision_radius must not exceed inflation_radius");
     }
@@ -283,7 +299,8 @@ private:
               "Trajectory to the goal flown, but the drone is %.2f m from it", off);
             return;
           }
-        } catch (const tf2::TransformException &) {
+        } catch (const tf2::TransformException & e) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "No drone pose: %s", e.what());
           return;
         }
         RCLCPP_INFO(get_logger(), "Goal reached");
@@ -312,19 +329,26 @@ private:
       return;
     }
     const auto hit = first_collision(map, flown, 0.0, smoothing_.collision_radius);
-    if (!hit) {
-      return;
-    }
     // Closer than collision_radius but not emergency_radius: a margin over the drone that
     // squeezing through a gap can graze as the map fills in. Too soon to replan anyway.
-    if (*hit < replan_lead_) {
+    if (hit && *hit < replan_lead_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
         "Within collision_radius of an obstacle %.1f s ahead, too soon to replan", *hit);
       return;
     }
-    RCLCPP_WARN(get_logger(), "Trajectory blocked %.1f s ahead, replanning", *hit);
-    publish_blocked_markers(flown, 0.0, *hit);
-    replan(Reason::Blocked);
+    if (hit) {
+      RCLCPP_WARN(get_logger(), "Trajectory blocked %.1f s ahead, replanning", *hit);
+      publish_blocked_markers(flown, 0.0, *hit);
+      replan(Reason::Blocked);
+      return;
+    }
+    // Into unseen space near the takeover point: no longer a plan we'd make from there.
+    const auto unseen = first_unseen(map, flown, replan_lead_, planner_->params().known_radius);
+    if (unseen) {
+      RCLCPP_WARN(get_logger(), "Trajectory enters unseen space %.1f s ahead, replanning", *unseen);
+      publish_blocked_markers(flown, 0.0, *unseen);
+      replan(Reason::Blocked);
+    }
   }
 
   // A shorter way while flying (if there's still a trajectory to take over from), or another
@@ -386,6 +410,11 @@ private:
       const auto s = state_at(takeover);
       start = s.position;
       start_state = PlannerNode::start_state(s);
+    } else if (!flown_.empty()) {
+      // The server holds the end of what it flew last, and only takes trajectories starting
+      // there: after a hard brake the drone can have overshot it by more than it allows.
+      const auto & last = *flown_.back().trajectory;
+      start = last.sample(last.duration()).position;
     } else {
       try {
         const auto tf = tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
@@ -397,11 +426,22 @@ private:
       }
     }
 
-    const auto planned = plan(tree, start, start_state, verbose);
+    const double known_radius = planner_->params().known_radius;
+    // From rest, a failure here isn't final yet (see below).
+    auto planned = plan(tree, start, start_state, known_radius, verbose && continuing);
+    if (!planned.trajectory && !continuing && known_radius > 0.0) {
+      // The server turns the drone to the first leg before starting, so the camera sees it.
+      planned = plan(tree, start, start_state, 0.0, verbose);
+      if (planned.trajectory) {
+        RCLCPP_INFO(get_logger(), "No way through seen space from here; looking along the "
+          "first leg");
+      }
+    }
     if (!planned.trajectory) {
       if (continuing && (reason == Reason::NewGoal || reason == Reason::Blocked)) {
-        // From a fresh takeover point: a search that fails can take longer than replan_lead.
-        const rclcpp::Time brake_at = now() + rclcpp::Duration::from_seconds(replan_lead_);
+        // As soon as the server can take it: the trajectory being flown is blocked or runs
+        // into unseen space, and that can be little more than replan_lead ahead.
+        const rclcpp::Time brake_at = now() + rclcpp::Duration::from_seconds(kBrakeLead);
         RCLCPP_WARN(get_logger(), "No way to the goal (%s); braking to a stop", name(reason));
         if (flying(brake_at)) {
           const auto s = state_at(brake_at);
@@ -437,30 +477,44 @@ private:
     std::shared_ptr<const WaypointTrajectory> trajectory;  // null on failure
   };
 
+  // known_radius overrides the parameter's (see the top).
   Planned plan(
     std::shared_ptr<const octomap::OcTree> tree, const Eigen::Vector3d & start,
-    const StartState & start_state, bool verbose)
+    const StartState & start_state, double known_radius, bool verbose)
   {
     Planned out;
+    AStarPlanner::Params params = planner_->params();
+    params.known_radius = known_radius;
+    const AStarPlanner planner(params);
+    SmoothingParams smoothing = smoothing_;
+    smoothing.known_radius = known_radius;
+    if (!dump_dir_.empty()) {
+      dump(*tree, start, start_state, params, smoothing);
+    }
     // One distance map for the search, shortcut and smoothing.
     const OctomapMap octomap(std::move(tree));
     const StickyMap sticky(octomap, sticky_);
     const auto t_map = std::chrono::steady_clock::now();
-    const DistanceMap map(sticky, planner_->params().bounds, planner_->max_distance());
+    const DistanceMap map(sticky, params.bounds, planner.max_distance());
     const auto t0 = std::chrono::steady_clock::now();
-    const auto result = planner_->plan(map, start, *goal_);
+    const auto result = planner.plan(map, start, *goal_);
     const auto t1 = std::chrono::steady_clock::now();
     if (result.status != AStarPlanner::Status::Success) {
+      // The periodic attempts fail the same way every time: once in a while is enough.
+      const char * format = "No path from (%.2f, %.2f, %.2f): %s (%d expansions, %.1f ms)";
       if (verbose) {
-        RCLCPP_WARN(get_logger(), "No path from (%.2f, %.2f, %.2f): %s (%d expansions, %.1f ms)",
-          start.x(), start.y(), start.z(), AStarPlanner::to_string(result.status),
-          result.expansions, Ms(t1 - t0).count());
+        RCLCPP_WARN(get_logger(), format, start.x(), start.y(), start.z(),
+          AStarPlanner::to_string(result.status), result.expansions, Ms(t1 - t0).count());
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, format, start.x(), start.y(),
+          start.z(), AStarPlanner::to_string(result.status), result.expansions,
+          Ms(t1 - t0).count());
       }
       return out;
     }
-    const auto waypoints = shortcut(map, result.path, planner_->params());
+    const auto waypoints = shortcut(map, result.path, params);
     const auto t2 = std::chrono::steady_clock::now();
-    const auto smoothed = smooth(map, waypoints, smoothing_, start_state);
+    const auto smoothed = smooth(map, waypoints, smoothing, start_state);
     const auto t3 = std::chrono::steady_clock::now();
     if (!smoothed.trajectory) {
       RCLCPP_WARN(get_logger(), "Smoothing failed (%zu waypoints): %s", waypoints.size(),
@@ -489,6 +543,28 @@ private:
     out.path = result.path;
     out.trajectory = smoothed.trajectory;
     return out;
+  }
+
+  void dump(
+    const octomap::OcTree & tree, const Eigen::Vector3d & start, const StartState & start_state,
+    const AStarPlanner::Params & params, const SmoothingParams & smoothing)
+  {
+    char name[32];
+    std::snprintf(name, sizeof(name), "/plan_%04d", dump_count_++);
+    const std::string base = dump_dir_ + name;
+    PlanInput in;
+    in.astar = params;
+    in.smoothing = smoothing;
+    in.start = start;
+    in.start_state = start_state;
+    in.goal = *goal_;
+    const OctomapMap map(std::shared_ptr<const octomap::OcTree>(&tree, [](auto *) {}));
+    for (const Key & k : sticky_) {
+      in.sticky.push_back(map.center(k));
+    }
+    if (!tree.writeBinaryConst(base + ".bt") || !write_plan_input(base + ".txt", in)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Can't write %s", base.c_str());
+    }
   }
 
   // Sends a trajectory to the server: as a continuation taking over at `start_time`, or
@@ -671,6 +747,8 @@ private:
   octomap_msgs::msg::Octomap::ConstSharedPtr map_msg_;
   std::deque<Segment> flown_;  // being flown, then continuations waiting to take over
   KeySet sticky_;  // every voxel ever seen occupied
+  std::string dump_dir_;
+  int dump_count_{0};
   std::optional<rclcpp::Time> awaiting_since_;  // sent from rest, not started yet
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

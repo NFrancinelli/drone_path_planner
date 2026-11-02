@@ -43,4 +43,35 @@ private:
   std::vector<double> distance_;
 };
 
+// Clearance along a path, voxel by voxel, for a path that may start closer than `radius` to
+// an obstacle (the drone stopped there): until it first gets clear it may only move away,
+// each voxel no closer than the one before; from then on every voxel must be clear.
+class EscapeCheck
+{
+public:
+  EscapeCheck(const DistanceMap & map, double radius)
+  : map_(map), radius_(radius) {}
+
+  // Feed the path's voxels in order, starting with the start's; false where it's too close.
+  bool ok(const Key & k)
+  {
+    const double d = map_.distance(k);
+    if (!escaping_ || d > radius_) {
+      escaping_ = false;
+      return d > radius_;
+    }
+    if (d < last_) {
+      return false;
+    }
+    last_ = d;
+    return true;
+  }
+
+private:
+  const DistanceMap & map_;
+  double radius_;
+  bool escaping_{true};
+  double last_{0.0};
+};
+
 }  // namespace path_planner

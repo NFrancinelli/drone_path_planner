@@ -140,6 +140,21 @@ TEST(Shortcut, KeepsClearanceThroughGap)
   }
 }
 
+TEST(Shortcut, CatchesAShortcutClippingAVoxelCorner)
+{
+  // The straight segment a -> b passes 2 cm through the corner of an occupied voxel
+  // (x, y = 0.25..0.5), between two samples a quarter voxel apart: the shortcut must see it.
+  TestMap map(Occupancy::Free);
+  map.set_box({0.3, 0.3, 0.0}, {0.3, 0.3, 3.0}, Occupancy::Occupied);
+  AStarPlanner::Params params;
+  params.inflation_radius = 0.01;
+  params.clearance_cost = 0.0;
+  const Eigen::Vector3d a(0.125, 0.86, kLayerZ), detour(0.125, 0.125, kLayerZ),
+  b(0.875, 0.11, kLayerZ);
+  const Path out = shortcut(distances(map), {a, detour, b}, params);
+  EXPECT_EQ(out.size(), 3u);
+}
+
 TEST(Shortcut, DoesNotCutThroughUnknownTheSearchAvoided)
 {
   // Same U-shaped free corridor as the A* test, unknown everywhere else.
@@ -157,6 +172,52 @@ TEST(Shortcut, DoesNotCutThroughUnknownTheSearchAvoided)
   EXPECT_LT(out.size(), raw.path.size());
   for (const auto & p : densify(map, out)) {
     EXPECT_EQ(map.at(map.key(p)), Occupancy::Free) << p.transpose();
+  }
+}
+
+TEST(Shortcut, StaysInSeenSpaceNearTheStart)
+{
+  // The U-shaped corridor, crossing at unknown_cost 0: the A* path keeps to the corridor
+  // within known_radius, and the shortcut mustn't cut that corner.
+  TestMap map(Occupancy::Unknown);
+  map.set_box({0.1, 0.1, kLayerZ}, {0.1, 2.1, kLayerZ}, Occupancy::Free);
+  map.set_box({0.1, 2.1, kLayerZ}, {4.1, 2.1, kLayerZ}, Occupancy::Free);
+  map.set_box({4.1, 0.1, kLayerZ}, {4.1, 2.1, kLayerZ}, Occupancy::Free);
+  const Eigen::Vector3d start(0.125, 0.125, kLayerZ);
+  AStarPlanner::Params params;
+  params.unknown_cost = 0.0;
+  params.known_radius = 1.0;
+  params.bounds = flat_bounds(-1.0, -1.0, 5.0, 3.0);
+  const auto raw = AStarPlanner(params).plan(map, start, {4.125, 0.125, kLayerZ});
+  ASSERT_EQ(raw.status, AStarPlanner::Status::Success);
+
+  const Path out = shortcut(distances(map), raw.path, params);
+  EXPECT_LT(out.size(), raw.path.size());
+  for (const auto & p : densify(map, out)) {
+    if ((map.center(map.key(p)) - start).norm() <= params.known_radius) {
+      EXPECT_EQ(map.at(map.key(p)), Occupancy::Free) << p.transpose();
+    }
+  }
+}
+
+TEST(Smooth, StopsAtCornerWhenTheCurveWouldEnterUnseenSpace)
+{
+  // Only the two legs' voxel rows have been seen; rounding the corner leaves them.
+  TestMap map(Occupancy::Unknown);
+  map.set_box(kCorner[0], kCorner[1], Occupancy::Free);
+  map.set_box(kCorner[1], kCorner[2], Occupancy::Free);
+  SmoothingParams params;
+  const auto rounded = smooth(distances(map), kCorner, params);
+  ASSERT_TRUE(rounded.trajectory);
+  EXPECT_EQ(rounded.stopped_knots, 0);
+
+  params.known_radius = 10.0;
+  const auto stopped = smooth(distances(map), kCorner, params);
+  ASSERT_TRUE(stopped.trajectory);
+  EXPECT_EQ(stopped.stopped_knots, 1);
+  for (double t = 0.0; t <= stopped.trajectory->duration(); t += 0.02) {
+    const auto p = stopped.trajectory->sample(t).position;
+    EXPECT_EQ(map.at(map.key(p)), Occupancy::Free) << "t = " << t;
   }
 }
 
@@ -314,6 +375,43 @@ TEST(Brake, StopsStraightAheadWithinLimits)
   expect_within_limits(*traj, params);
 }
 
+TEST(Brake, StartsAHairOverTheLimits)
+{
+  // A start sampled off a trajectory, e.g. a brake decelerating at exactly max_acc, can be
+  // just over a limit; and one still speeding up when the brake starts (case 3) has to carry
+  // on a little before stopping. Smoothing and braking from either used to search for a
+  // duration forever, freezing the planner mid-flight.
+  const TestMap map(Occupancy::Free);
+  const SmoothingParams params;
+  const Eigen::Vector3d at(0.125, 0.125, 2.125);
+  for (int over = 0; over < 4; ++over) {
+    path_planner::StartState start;
+    start.velocity = Eigen::Vector3d(0.5, 0.0, 0.0);
+    start.yaw = 0.0;
+    if (over == 0) {
+      start.velocity.x() = params.max_vel * 1.001;
+    } else if (over == 1) {
+      start.acceleration = Eigen::Vector3d(-params.max_acc * 1.001, 0.0, 0.0);
+    } else if (over == 2) {
+      start.yaw_rate = params.max_yaw_rate * 1.001;
+    } else {
+      start.acceleration = Eigen::Vector3d(params.max_acc, 0.0, 0.0);
+    }
+    const auto traj = path_planner::brake(at, start, params);
+    ASSERT_TRUE(traj) << "case " << over;
+    EXPECT_LT(traj->sample(traj->duration()).velocity.norm(), 1e-9) << "case " << over;
+    EXPECT_LT(traj->duration(), 5.0) << "case " << over;
+    if (over == 3) {
+      expect_within_limits(*traj, params);
+      for (double t = 0.0; t <= traj->duration(); t += 0.02) {
+        EXPECT_GE(traj->sample(t).velocity.x(), -1e-9) << "t = " << t;
+      }
+    }
+    EXPECT_TRUE(smooth(distances(map), {at, at + Eigen::Vector3d(5.0, 0.0, 0.0)}, params, start)
+      .trajectory) << "case " << over;
+  }
+}
+
 TEST(FirstCollision, FindsWhereATrajectoryRunsIntoTheMap)
 {
   TestMap map(Occupancy::Free);
@@ -330,6 +428,61 @@ TEST(FirstCollision, FindsWhereATrajectoryRunsIntoTheMap)
   EXPECT_FALSE(path_planner::first_collision(map, line, 9.0, 0.4));
   const trajectory_server::QuinticLine clear({0, 3, 2.125}, {6, 3, 2.125}, 0.0, 12.0);
   EXPECT_FALSE(path_planner::first_collision(map, clear, 0.0, 0.4));
+}
+
+TEST(FirstCollision, StartingTooCloseOnlyCountsWhenGettingCloser)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({3.1, -2.0, 0.0}, {3.1, 2.0, 4.0}, Occupancy::Occupied);  // wall x = 3..3.25
+  // Stopped inside the 0.5 m radius (voxel centers 0.5 m apart), holding: the drone braked
+  // there. Not a collision, or the planner would brake forever instead of finding a way out.
+  const trajectory_server::QuinticLine hold({2.625, 0, 2.125}, {2.625, 0, 2.125}, 0.0, 1.0);
+  EXPECT_FALSE(path_planner::first_collision(map, hold, 0.0, 0.5));
+  // Leaving, or sliding along at the same distance: fine. Going closer: a collision.
+  const trajectory_server::QuinticLine away({2.625, 0, 2.125}, {0, 0, 2.125}, 0.0, 5.0);
+  EXPECT_FALSE(path_planner::first_collision(map, away, 0.0, 0.5));
+  const trajectory_server::QuinticLine along({2.625, -1, 2.125}, {2.625, 1, 2.125}, 0.0, 4.0);
+  EXPECT_FALSE(path_planner::first_collision(map, along, 0.0, 0.5));
+  const trajectory_server::QuinticLine closer({2.625, 0, 2.125}, {2.85, 0, 2.125}, 0.0, 1.0);
+  EXPECT_TRUE(path_planner::first_collision(map, closer, 0.0, 0.5));
+  // Once clear, coming back is a collision again.
+  using Knot = trajectory_server::WaypointTrajectory::Knot;
+  const trajectory_server::WaypointTrajectory out_and_back(
+    {Knot{{2.625, 0, 2.125}}, Knot{{1.5, 0, 2.125}}, Knot{{2.625, 0, 2.125}}}, {3.0, 3.0}, 0.0);
+  const auto t = path_planner::first_collision(map, out_and_back, 0.0, 0.5);
+  ASSERT_TRUE(t);
+  EXPECT_GT(*t, 3.0);
+}
+
+TEST(FirstUnseen, FindsUnseenSpaceNearTheTakeoverPoint)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({3.1, -2.0, 0.0}, {3.1, 2.0, 4.0}, Occupancy::Unknown);  // x = 3..3.25
+  const trajectory_server::QuinticLine line({0, 0, 2.125}, {6, 0, 2.125}, 0.0, 12.0);
+  // From x = 0, it's farther than the radius.
+  EXPECT_FALSE(path_planner::first_unseen(map, line, 0.0, 1.5));
+  // From x = 2, it's 1 m on.
+  double t0 = 0.0;
+  while (line.sample(t0).position.x() < 2.0) {
+    t0 += 0.01;
+  }
+  const auto t = path_planner::first_unseen(map, line, t0, 1.5);
+  ASSERT_TRUE(t);
+  EXPECT_NEAR(line.sample(*t).position.x(), 3.0, 0.05);
+  // Off: nothing.
+  EXPECT_FALSE(path_planner::first_unseen(map, line, t0, 0.0));
+}
+
+TEST(Smooth, LeavesAStartInsideCollisionRadius)
+{
+  TestMap map(Occupancy::Free);
+  map.set_box({3.1, -2.0, 0.0}, {3.1, 2.0, 4.0}, Occupancy::Occupied);  // wall x = 3..3.25
+  const auto dist = distances(map);
+  SmoothingParams params;
+  params.collision_radius = 0.6;
+  // 0.25 m from the wall: the next voxel out is still inside the radius.
+  const auto result = smooth(dist, {{2.75, 0, 2.125}, {0, 0, 2.125}, {0, 3, 2.125}}, params);
+  ASSERT_TRUE(result.trajectory) << result.failure;
 }
 
 TEST(Smooth, CruisesAtMaxSpeedOnLongLegs)

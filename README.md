@@ -19,6 +19,8 @@ Project page: https://nfrancinelli.github.io/projects/3d-planner/
   - [x] New plans take over a trajectory in flight without a jump
   - [x] Replanning when the path gets blocked, switching to clearly shorter ways, braking when stuck
 - [ ] Milestone 5 – unknown-cost comparison + demo video
+  - [x] Unknown-cost comparison (see Unknown-space cost)
+  - [ ] Demo video
 
 ## Quick start
 
@@ -34,6 +36,7 @@ ros2 launch drone_bringup sim.launch.py rviz:=false   # nothing on screen
 ros2 launch drone_bringup sim.launch.py localization:=gps   # PX4's GPS/compass estimate
 ros2 launch drone_bringup sim.launch.py world:=boxes figure_eight:=true  # fly a figure-eight, land
 ros2 launch drone_bringup sim.launch.py show_free_space:=true  # also publish OctoMap free voxels
+ros2 launch drone_bringup sim.launch.py real_time_factor:=0.5  # half speed, for a loaded host
 ```
 
 Gazebo runs headless by default (sensors render offscreen on the GPU); RViz shows the drone,
@@ -49,7 +52,10 @@ Run `docker/run.sh` again from another terminal to attach a second shell to the 
 
 ## Flying to a goal
 
-Launch the sim: the drone takes off and hovers. Then use **2D Goal Pose**
+Launch the sim: the drone takes off and hovers (if PX4 hasn't climbed to within 0.5 m of
+the takeoff altitude 10 s after the climb, the trajectory server logs "Takeoff failed" and
+lands; PX4 occasionally arms, reports the takeoff and stays on the ground). Then use
+**2D Goal Pose**
 in the RViz toolbar to click a goal (flown at `goal_altitude`, 2.5 m by default). The planner
 plans from the drone's current position on the latest OctoMap and shows:
 
@@ -75,6 +81,24 @@ The planner pursues the goal until it's reached, replanning as the map grows:
 - if it would come within `emergency_radius` of an obstacle sooner than a new plan could take
   over, the drone brakes at once.
 
+The drone only flies where it can stop in space it has seen. The camera sees nothing beside
+or below the drone, so a plan that turns into the unseen side of a block it just flew past,
+or dips under what the camera has seen of it, finds the wall 0.5–1 m away: too late to stop.
+So unknown space within `known_radius` (1.5 m) of a plan's start is blocked, for A*, the
+shortcut and smoothing alike; and a flown trajectory that would enter unknown space within
+`known_radius` of the takeover point counts as blocked too, so the drone replans, or brakes,
+before it gets there: the takeover point is `replan_lead` (~1 m) ahead, so it looks 2.5 m
+ahead, more than the ~2 m stopping distance (see Speed and safety). `unknown_cost` still
+sets how much farther unknown space costs. From rest, a plan that fails only on this rule is
+still flown: the server turns the drone to face the first leg before starting it, which puts
+it in view.
+
+OctoMap only maps along rays that hit something, and the hall has no roof: the space
+straight ahead at flight altitude, down a long aisle, stayed unknown until a wall came
+within the camera's 10 m, and the drone crept along it, stopping every few metres.
+`no_return_rays.py` turns the camera's no-return pixels into points just past 10 m along
+their rays, so OctoMap clears them up to 10 m without marking anything at their end.
+
 Every voxel ever seen occupied stays an obstacle for the planner: the worlds are static, and
 OctoMap can open holes in a wall seen at a grazing angle (the surface sits mid-voxel, and
 rays passing along it mark the voxel free), which the planner would otherwise fly through.
@@ -90,6 +114,7 @@ climbs over the crates and stops within 15 cm of the goal, in about 40 s. Main `
 |---|---|---|
 | `inflation_radius` | 0.5 m | Clearance A* and the shortcut keep from occupied voxels |
 | `unknown_cost` | 1.0 | Extra cost per metre in unknown space (0 = treat as free) |
+| `known_radius` | 1.5 m | Unknown space this close to a plan's start, or to the takeover point while flying, is blocked |
 | `vertical_cost` | 1.0 | Extra cost per metre of climb or descent, so paths keep their altitude unless climbing pays off |
 | `clearance_radius`, `clearance_cost` | 1.0 m, 1.0 | Within this distance of an obstacle, extra cost per metre rising to `clearance_cost` at `inflation_radius`: paths run down the middle of gaps |
 | `collision_radius` | 0.45 m | Clearance the smoothed and flown trajectory must keep (drone radius 0.39 m); ≤ `inflation_radius` |
@@ -99,7 +124,21 @@ climbs over the crates and stops within 15 cm of the goal, in about 40 s. Main `
 | `improve_min_gain`, `improve_min_ratio` | 1.0 s, 0.1 | How much sooner a new plan must arrive to replace the current one |
 | `emergency_radius` | 0.4 m | Closer than this to an obstacle within `replan_lead`: brake at once |
 | `max_vel`, `max_acc` | 1.0 m/s, 1.0 m/s² | Trajectory limits |
-| `bounds_min`, `bounds_max` | (−20, −20, 0.5), (20, 20, 4) m | Search volume |
+| `shortcut_slack` | 0.05 | How much more (relative) a straight shortcut may cost than the A* path it replaces: straightens the small sidesteps A* takes to stay in voxels it has seen |
+| `bounds_min`, `bounds_max` | (−20, −20, 1), (20, 20, 4) m; in `factory` the hall inside its walls | Search volume. The bottom is the floor clearance: the forward camera never sees the floor, so lower plans looking for a way under an obstacle put the drone on it |
+| `dump_dir` | empty (off) | Save every plan's inputs here, to replay it offline with `plan_replay` |
+
+The launch file sets the planner's search volume per world: in `factory`, the inside of the
+hall. Searching the unknown space outside its walls would cost A* most of its expansions
+while the hall is unexplored, and with a high `unknown_cost` run out of them before reaching
+the goal. `unknown_cost` is also a launch argument (`unknown_cost:=0`).
+
+Every check works on voxels, so the planner makes sure they agree: a diagonal A* step must
+not squeeze past a blocked voxel (no cutting corners), and the shortcut checks every voxel a
+straight segment passes through, so the smoothed trajectory, sampled more finely, never runs
+into a voxel the search didn't check. A drone that stopped closer to an obstacle than these
+margins (after a hard brake) may only move away from it until it's clear: A*, smoothing and
+the collision check all allow that, so it can always plan its way out.
 
 ## Speed and safety
 
@@ -142,6 +181,124 @@ ros2 run drone_bringup mission_metrics.py 19.5 0 --csv runs.csv --label "unknown
 
 Runs of the same mission vary by tens of seconds (the map fills in a little differently
 each time, and a run may brake and restart once), so compare averages over a few runs.
+Benchmark with `real_time_factor:=0.5` on a busy host: at full speed, with every core busy
+(Gazebo rendering, OctoMap, long A* searches, plus a browser), PX4 can miss IMU samples
+(`Accel #0 fail: TIMEOUT` in its log), lose its height estimate and drop to the floor, even
+hovering with no planner input. Everything runs on sim time, so the measurements don't change.
+`--trail routes/run1.csv` also saves the flown positions, which
+`plot_routes.py` draws over the world from above (it runs on the host, with matplotlib).
+
+To debug a plan, launch with `dump_dir:=/ws/dumps` (the directory must exist): the planner
+saves every plan's map and inputs, and
+
+```bash
+ros2 run path_planner plan_replay /ws/dumps/plan_0012 [start=x,y,z] [goal=x,y,z] [unknown_cost=2] ...
+```
+
+replays it offline through A*, the shortcut and smoothing, printing each step's waypoints
+and clearances, optionally from another start, to another goal or with other parameters;
+`samples=<file>` also writes the smoothed trajectory as CSV.
+
+## Unknown-space cost
+
+`unknown_cost` is how optimistic the planner is about space it hasn't seen: 0 treats it as
+free, higher values make it prefer space it has seen to be free. Compared on a two-leg
+mission in `factory`, 3 runs per value (`docs/benchmark/`: one row per leg in
+`benchmark.csv`, flown positions in `trail_*.csv`):
+
+1. from the start to (19.5, 0), behind the crate wall: the whole hall is unknown, and every
+   route goes through it;
+2. back to (3.8, 7.5) by the start, from behind the crates: either back over them through the
+   corridor mapped on leg 1, or round through the unexplored north aisle (about as long, no
+   climb).
+
+| `unknown_cost` | Leg 1 time | Leg 1 blocked replans | Leg 2 route | Leg 2 time | Leg 2 blocked replans |
+|---|---|---|---|---|---|
+| 0 | 40.6 s | 13.7 | north aisle, 22.3 m | 34.6 s | 2 |
+| 1 (default) | 36.4 s | 8.0 | north aisle, 22.4 m | 36.1 s | 2 |
+| 10 | 38.8 s | 10.3 | known corridor, 23.8 m | 35.8 s | 0 |
+
+All 18 legs reached the goal; the closest any run came to an obstacle was 0.41 m (drone
+radius 0.39 m). Flown at `real_time_factor:=0.5` (see Measuring a flight).
+
+![Routes flown, from above](docs/benchmark/routes.png)
+
+On leg 1 every value takes the same route, the only one there is; what changes is how often
+the drone is surprised. At 0, plans run straight through whatever hasn't been seen,
+including the sides of the blocks next to the corridor, and more of them get blocked by what
+comes into view (one run took 51 s, with 22 blocked replans). On leg 2 the cost picks the
+route: 0 and 1 gamble on the unexplored aisle, 10 flies back the way it knows. Here the
+gamble pays off (the aisle is open), so the times barely differ; when it's blocked, the
+known way wins (below).
+
+Higher values make A* search more: unknown space costs up to 11× per metre while its
+heuristic counts 1, so it expands much of the hall before reaching a goal behind it (up to
+~170k expansions and 0.4 s at 10, ~9k and 25 ms at 0). With the old ±20 m search volume
+it ran out of expansions above 2 or so, which is why the volume is now fitted to the hall.
+
+### When the gamble fails: a blocked aisle
+
+`factory_blocked` is the same hall with shelving closing the north aisle at x = 7, out of
+sight until the drone turns into the aisle. Same mission, 3 runs per value
+(`docs/benchmark_blocked/`). Leg 1 is unchanged (35–39 s at every value); leg 2:
+
+| `unknown_cost` | Leg 2 route | Leg 2 time | Distance | Blocked replans |
+|---|---|---|---|---|
+| 0 | into the north aisle, back out, round the south aisle | 79.0 s (78.5–79.5) | 55.0 m | 8.7 |
+| 1 (default) | into the north aisle, back over the crates | 62.9 s (62.4–63.5) | 41.5 m | 4.7 |
+| 10 | over the crates, through the corridor mapped on leg 1 | 35.8 s (35.3–36.6) | 23.8 m | 0 |
+
+All 18 legs reached the goal, at least 0.49 m from any obstacle.
+
+![Leg 2 routes in the blocked hall, from above](docs/benchmark_blocked/routes.png)
+
+The aisle is the shorter way on the map, so 0 and 1 try it, find the blocker once it comes
+within the camera's range, and turn back. Then they differ: 0 still prefers unseen space and
+goes round by the south aisle, which happens to be open; 1 now finds the known corridor
+cheaper. 10 never leaves known space and arrives in less than half the time. So a high cost
+wins when the unknown turns out blocked, and loses little when it doesn't in this hall (above)
+— but only because here the unseen way is barely shorter (below).
+
+This benchmark is what found the known-space rule's reason to exist. Before it, in 4 of 6
+cost-0 runs the return leg grazed or hit `block_south`: plans turned from the aisle along
+its east face, which the camera had only seen from the side, straight into it. The batches
+testing the rule then caught the planner freezing mid-flight (in 1 of 9 runs, and one
+earlier crash with the same signature): braking from a drone still speeding up searched
+forever for a duration that fit, and the drone flew its last trajectory blind into the crate
+wall. Braking now accounts for the starting acceleration, and every such search is bounded.
+
+### When the gamble pays: a hidden shortcut
+
+In `factory`, no return goal makes the unseen way much shorter. Replaying the first plan of
+leg 2 (`plan_replay ... goal=`) to goals along the north aisle, the short way at low cost
+always ran through the inside of `block_north`: 5 m shelving whose inside and top the camera
+never sees, so the map has it as unknown. The drone finds the face and slides round it, and
+the aisle it ends up flying is about as long as the corridor it knows.
+
+`factory_detour` is the empty hall cut by a 5 m divider at x = 10, with a wide door at its
+north end, which the camera sees on the way out, and a 1.8 m door at its south end, which
+it never does. Leg 1 goes from the start to (19.5, 0), round the north end at every value;
+leg 2 back to (6, −7.5), either the way the drone came (through the north door, ~27 m) or
+through the unseen part of the divider (the south door, ~17 m). Replaying leg 2's first
+plan, the planner switches to the known way between 3 and 5. 3 runs per value
+(`docs/benchmark_detour/`); leg 2:
+
+| `unknown_cost` | Leg 2 route | Leg 2 time | Distance | Blocked replans |
+|---|---|---|---|---|
+| 0 | through the south door | 26.2 s (26.0–26.4) | 17.2 m | 3.7 |
+| 1 (default) | through the south door | 26.3 s (26.2–26.3) | 17.2 m | 10.7 |
+| 10 | back through the north door | 40.9 s (38.3–46.0) | 26.6 m | 0.3 |
+
+All 18 legs reached the goal, at least 0.45 m from any obstacle; leg 1 took 29–35 s.
+
+![Routes in the divided hall, from above](docs/benchmark_detour/routes.png)
+
+0 and 1 plan through the divider where it hasn't been seen, find its face as they close in
+(the blocked replans), follow it south and find the door; 10 flies back the way it knows and
+takes half as long again. Together with the blocked aisle, the cost is a bet whose outcome
+depends on the hall, not a setting to maximise: against the default, 10 won by 27 s when
+the unseen way was a dead end and lost by 15 s when it was a shortcut. 1 stays the default: it takes the shortcut
+here, and in the blocked hall it turns back to the known corridor once the dead end is seen.
 
 ## Localization
 
@@ -166,10 +323,10 @@ ground truth during the figure-eight (`world:=boxes figure_eight:=true`), its he
 | `docker/` | Ubuntu 24.04 + ROS 2 Jazzy + Gazebo Harmonic + PX4 v1.17.0 + XRCE-DDS agent |
 | `ros2_ws/src/trajectory_server` | Streams setpoints to PX4 in offboard mode; ROS-free trajectory core (quintic segments, figure-eight, waypoint trajectories) with unit tests |
 | `ros2_ws/src/drone_interfaces` | Planner → trajectory server message (`WaypointTrajectory`) |
-| `ros2_ws/src/path_planner` | Planner node on the live OctoMap; ROS-free core with unit tests: A* with obstacle inflation and a cost for unknown space, path shortcutting, trajectory smoothing |
+| `ros2_ws/src/path_planner` | Planner node on the live OctoMap; ROS-free core with unit tests: A* with obstacle inflation and a cost for unknown space, path shortcutting, trajectory smoothing; `plan_replay` to debug a dumped plan offline |
 | `ros2_ws/src/px4_state_bridge` | PX4 odometry → `/odom`, TF, flown trail, drone model for RViz; `mocap_bridge` feeds ground truth to PX4 as external vision |
-| `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world, `factory` hall (1.5 m gaps, a corridor dead-ending at a crate wall) |
-| `ros2_ws/src/drone_bringup` | Launch files, RViz config |
+| `ros2_ws/src/drone_sim` | Gazebo models and worlds: `x500_depth_lite` (x500 + one 320×240 @ 10 Hz depth camera, pitched up 12°), `boxes` test world, `factory` hall (1.5 m gaps, a corridor dead-ending at a crate wall), `factory_blocked` (the same hall with its north aisle closed), `factory_detour` (the empty hall cut by a divider with a door at each end) |
+| `ros2_ws/src/drone_bringup` | Launch files, RViz config, `no_return_rays.py` (the camera's no-return pixels as rays OctoMap clears), `mission_metrics.py` (fly to a goal, measure the flight) and `plot_routes.py` (draw flown routes) |
 
 ## Conventions
 
@@ -192,7 +349,10 @@ server are stamped with system time.
 - Localization is simulated motion capture by default (see above); robustness to onboard
   state-estimation error is not evaluated yet.
 - Single forward-facing depth camera: test worlds contain no obstacles directly above or
-  below the flight path.
+  below the flight path. The camera also never sees the walls beside the drone, so in the
+  factory corridor the planner keeps finding "ways" through the unseen sides of the blocks
+  next to it. `known_radius` keeps these out of the next 1.5 m, so the drone replans before
+  it turns into them; a higher `unknown_cost` makes them rarer (see Unknown-space cost).
 - Planning takes up to ~0.55 s while most of the hall is unknown (distance map over the
   whole planning volume ~70 ms, A* up to ~500 ms), within the 1 s `replan_lead`.
 - Clearances are measured between voxel centers, which can be half a voxel (0.1 m) closer
@@ -200,5 +360,8 @@ server are stamped with system time.
   the drone's 0.39 m radius. The clearance cost keeps paths centred (~0.35 m of margin each
   side in a 1.5 m gap); the thin worst case needs an off-centre squeeze.
 - PX4 overshoots the commanded speed by ~16 % after accelerating (see Speed and safety).
+- A no-return pixel counts as nothing within 10 m. True in simulation; a real depth camera
+  also returns nothing for surfaces it can't measure (glass, black, too close), which this
+  would clear.
 - Obstacles are sticky (static worlds only): a moving obstacle, or a noisy depth reading,
   would stay in the planner's map for good.

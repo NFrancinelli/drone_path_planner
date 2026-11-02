@@ -20,6 +20,7 @@ namespace path_planner
 // gaps and corridors instead of hugging their edges. Climbing or descending costs an extra
 // vertical_cost per metre of height change, so the drone keeps its altitude unless a climb
 // actually pays off; without it, paths wander up and down between near-equal options.
+// Unknown voxels within known_radius of the start are blocked (see unseen_near).
 // The search is clamped to `bounds`, which also keeps it from expanding forever into
 // unknown space.
 class AStarPlanner
@@ -32,8 +33,13 @@ public:
     double vertical_cost{1.0};     // extra cost per metre of height change, 0 = free
     double clearance_radius{1.0};  // [m] obstacles closer than this add clearance cost
     double clearance_cost{1.0};    // extra cost per metre right at inflation_radius
+    double known_radius{0.0};      // [m] unknown space this close to the start is blocked
     Eigen::AlignedBox3d bounds{Eigen::Vector3d(-20.0, -20.0, 0.5), Eigen::Vector3d(20.0, 20.0, 5.0)};
     int max_expansions{200000};
+    // Shortcut only: how much more (relative) a straight segment may cost than the path it
+    // replaces. A little lets it straighten the small sidesteps A* takes to stay in voxels
+    // it has seen, or to gain a few cm of clearance.
+    double shortcut_slack{0.05};
   };
 
   enum class Status { Success, StartOutOfBounds, GoalOutOfBounds, GoalBlocked, NoPath, ExpansionLimit };
@@ -48,8 +54,9 @@ public:
 
   explicit AStarPlanner(const Params & params);
 
-  // The start voxel is allowed to be blocked, in case the drone is already closer to a
-  // wall than inflation_radius. The distance map must cover `bounds` up to max_distance().
+  // The start is allowed to be blocked, in case the drone is already closer to a wall
+  // than inflation_radius: the path then moves straight away until it's clear. The distance
+  // map must cover `bounds` up to max_distance().
   Result plan(const DistanceMap & map, const Eigen::Vector3d & start, const Eigen::Vector3d & goal) const;
   // Builds the distance map over `bounds` first.
   Result plan(const OccupancyMap & map, const Eigen::Vector3d & start, const Eigen::Vector3d & goal) const;
@@ -68,5 +75,13 @@ private:
 // Cost per metre of moving through voxel k, before the vertical cost: 1, plus unknown_cost
 // if unknown, plus the clearance cost. Shared by A* and the shortcut so they always agree.
 double step_weight(const AStarPlanner::Params & params, const DistanceMap & map, const Key & k);
+
+// Voxel k is unknown and within `radius` of `start` (center to point), other than the
+// start's own voxel. The drone must only fly where it can stop in space it has seen: the
+// forward camera sees nothing beside or below it, so a path turning or dropping into unseen
+// space close by can find a wall there too late to stop. Shared by A*, the shortcut,
+// smoothing and the planner's in-flight check so they always agree.
+bool unseen_near(
+  const OccupancyMap & map, const Key & k, const Eigen::Vector3d & start, double radius);
 
 }  // namespace path_planner

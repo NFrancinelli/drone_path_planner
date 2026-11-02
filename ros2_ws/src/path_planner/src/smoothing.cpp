@@ -23,20 +23,42 @@ struct SegmentCheck
   double cost{0.0};
 };
 
-// Samples a -> b every quarter voxel. Cost uses the A* weighting per sampled voxel.
+// Every voxel a -> b passes through, in order. Sampling the segment instead can miss a
+// voxel whose corner it clips between two samples, which the smoothed trajectory, sampled
+// more finely, then runs into. Cost uses the A* weighting, times the length in each voxel.
+// A segment from a blocked point (escaping, see EscapeCheck) may only move away, and none
+// may enter unknown space within known_radius of the path's start (unseen_near).
 SegmentCheck check_segment(
-  const DistanceMap & map, const Key & exempt, const Eigen::Vector3d & a,
-  const Eigen::Vector3d & b, const AStarPlanner::Params & params)
+  const DistanceMap & map, const Eigen::Vector3d & a, const Eigen::Vector3d & b,
+  const AStarPlanner::Params & params, const Eigen::Vector3d & start)
 {
+  // Where the segment crosses voxel boundaries, as fractions of it; the middle of each
+  // piece in between lies inside exactly one voxel. Pieces too short to matter (passing
+  // through an edge or corner) are skipped.
+  const double res = map.resolution();
+  std::vector<double> cuts{0.0, 1.0};
+  for (int i = 0; i < 3; ++i) {
+    const double lo = std::min(a[i], b[i]), hi = std::max(a[i], b[i]);
+    for (int m = static_cast<int>(std::floor(lo / res)) + 1; m * res < hi; ++m) {
+      cuts.push_back((m * res - a[i]) / (b[i] - a[i]));
+    }
+  }
+  std::sort(cuts.begin(), cuts.end());
+
   const double length = (b - a).norm();
-  const int n = std::max(1, static_cast<int>(std::ceil(length / (0.25 * map.resolution()))));
   SegmentCheck check;
-  for (int i = 1; i <= n; ++i) {
-    const Key k = map.key(a + (b - a) * (static_cast<double>(i) / n));
-    if (k != exempt && map.distance(k) <= params.inflation_radius) {
+  EscapeCheck clearance(map, params.inflation_radius);
+  clearance.ok(map.key(a));
+  for (size_t i = 0; i + 1 < cuts.size(); ++i) {
+    const double piece = (cuts[i + 1] - cuts[i]) * length;
+    if (piece < 1e-6) {
+      continue;
+    }
+    const Key k = map.key(a + (b - a) * (0.5 * (cuts[i] + cuts[i + 1])));
+    if (!clearance.ok(k) || unseen_near(map, k, start, params.known_radius)) {
       check.clear = false;
     }
-    check.cost += step_weight(params, map, k) * length / n;
+    check.cost += step_weight(params, map, k) * piece;
   }
   check.cost += params.vertical_cost * std::abs(b.z() - a.z());
   return check;
@@ -59,8 +81,13 @@ double segment_duration(
   const Eigen::Vector3d delta = b.position - a.position;
   const Eigen::Vector3d dir = delta.normalized();
   // The true peak can fall between samples, so keep a margin; otherwise the full check in
-  // smooth() sees it and slows the corner down for nothing.
+  // smooth() sees it and slows the corner down for nothing. A moving start sampled off a
+  // trajectory can be a hair over the limits: they stretch to it, or nothing would fit.
   constexpr double kMargin = 0.99;
+  const double max_vel = std::max(
+    {params.max_vel * kMargin, a.velocity.norm(), b.velocity.norm()}) * (1.0 + 1e-9);
+  const double max_acc = std::max(
+    {params.max_acc * kMargin, a.acceleration.norm(), b.acceleration.norm()}) * (1.0 + 1e-9);
   const auto fits = [&](double T) {
       const QuinticHermite seg(
         a.position, a.velocity, a.acceleration, b.position, b.velocity, b.acceleration, T);
@@ -68,8 +95,7 @@ double segment_duration(
       for (int i = 0; i <= kSamples; ++i) {
         const double u = T * i / kSamples;
         const Eigen::Vector3d v = seg.velocity(u);
-        if (v.norm() > params.max_vel * kMargin * (1.0 + 1e-9) ||
-          seg.acceleration(u).norm() > params.max_acc * kMargin * (1.0 + 1e-9) ||
+        if (v.norm() > max_vel || seg.acceleration(u).norm() > max_acc ||
           (!allow_reverse && v.dot(dir) < -1e-9))
         {
           return false;
@@ -94,34 +120,46 @@ double segment_duration(
 }
 
 // Where a moving start comes to rest when braking straight ahead: the end of the shortest
-// segment from it to rest at p0 + v0 * T / 2 (as if decelerating evenly) that stays within
-// the limits and never moves backwards. Its duration goes to `duration` if given.
+// segment from it to rest at p0 + v0 T / 2 + a0 T^2 / 12 that stays within the limits and
+// never moves backwards. Its duration goes to `duration` if given. That end makes the
+// velocity (1 - s)^2 (v0 + (a0 T + 2 v0) s), s = t / T: without a0, an even-ish stop; with
+// it, still accelerating when the brake starts (a ramp up), it carries on a little first.
+// (A fixed v0 T / 2 fits no duration then: short ones are over max_acc, long ones reverse.)
+// A start sampled off a trajectory can be a hair over the limits (a brake decelerates at
+// exactly max_acc): the limits then stretch to the start's, or no duration would ever fit.
 WaypointTrajectory::Knot braking_stop(
   const WaypointTrajectory::Knot & from, const SmoothingParams & params,
   double * duration = nullptr)
 {
   const Eigen::Vector3d dir = from.velocity.normalized();
   const Eigen::Vector3d zero = Eigen::Vector3d::Zero();
-  for (double T = 0.1; ; T *= 1.05) {
-    const Eigen::Vector3d end = from.position + from.velocity * T / 2.0;
-    const QuinticHermite seg(from.position, from.velocity, from.acceleration, end, zero, zero, T);
+  const double max_vel = std::max(params.max_vel, from.velocity.norm()) * (1.0 + 1e-9);
+  const double max_acc = std::max(params.max_acc, from.acceleration.norm()) * (1.0 + 1e-9);
+  WaypointTrajectory::Knot stop;
+  double T = 0.1;
+  // 1.05^300: from 0.1 s to well past any stop within the limits. Past that, give up and use
+  // the last one rather than hang.
+  for (int attempt = 0; attempt < 300; ++attempt, T *= 1.05) {
+    stop.position =
+      from.position + from.velocity * T / 2.0 + from.acceleration * T * T / 12.0;
+    const QuinticHermite seg(
+      from.position, from.velocity, from.acceleration, stop.position, zero, zero, T);
     bool fits = true;
     constexpr int kSamples = 64;
     for (int i = 0; i <= kSamples && fits; ++i) {
       const double u = T * i / kSamples;
       const Eigen::Vector3d v = seg.velocity(u);
-      fits = v.norm() <= params.max_vel * (1.0 + 1e-9) &&
-        seg.acceleration(u).norm() <= params.max_acc * (1.0 + 1e-9) && v.dot(dir) >= -1e-9;
+      fits = v.norm() <= max_vel && seg.acceleration(u).norm() <= max_acc &&
+        v.dot(dir) >= -1e-9;
     }
     if (fits) {
-      WaypointTrajectory::Knot stop;
-      stop.position = end;
-      if (duration) {
-        *duration = T;
-      }
-      return stop;
+      break;
     }
   }
+  if (duration) {
+    *duration = T;
+  }
+  return stop;
 }
 
 // Long straight legs ramp up to cruise speed, cruise, and ramp down, instead of being one
@@ -188,10 +226,12 @@ std::vector<double> add_cruise(
 }
 
 // Shortest duration for a yaw turn from (from, rate) to `to` at rest, within the yaw rate
-// and acceleration limits. Same profile as WaypointTrajectory's first turn.
+// and acceleration limits. Same profile as WaypointTrajectory's first turn. A start rate a
+// hair over the limit (sampled at the peak of a turn) stretches it, as in braking_stop.
 double first_turn_duration(double from, double rate, double to, const SmoothingParams & params)
 {
   const double delta = trajectory_server::wrap_angle(to - from);
+  const double max_rate = std::max(params.max_yaw_rate, std::abs(rate));
   const auto fits = [&](double T) {
       constexpr int kSamples = 64;
       for (int i = 0; i <= kSamples; ++i) {
@@ -204,7 +244,7 @@ double first_turn_duration(double from, double rate, double to, const SmoothingP
         const double ddh = -36.0 * tau + 96.0 * tau2 - 60.0 * tau3;
         const double r = delta * ds / T + rate * dh;
         const double acc = delta * dds / (T * T) + rate * ddh / T;
-        if (std::abs(r) > params.max_yaw_rate * (1.0 + 1e-9) ||
+        if (std::abs(r) > max_rate * (1.0 + 1e-9) ||
           std::abs(acc) > params.max_yaw_acc * (1.0 + 1e-9))
         {
           return false;
@@ -214,8 +254,8 @@ double first_turn_duration(double from, double rate, double to, const SmoothingP
     };
   double T = std::max(
     YawTurn::min_duration(from, to, params.max_yaw_rate, params.max_yaw_acc), 0.1);
-  while (!fits(T)) {
-    T *= 1.1;
+  for (int attempt = 0; attempt < 200 && !fits(T); ++attempt) {
+    T *= 1.1;  // 1.1^200: far past any turn within the limits; then give up rather than hang
   }
   return T;
 }
@@ -229,13 +269,11 @@ std::vector<Eigen::Vector3d> shortcut(
   if (path.size() <= 2) {
     return path;
   }
-  const Key exempt = map.key(path.front());
-
   // Cost of the original path up to each waypoint, measured like the shortcuts.
   std::vector<double> cost_to{0.0};
   for (size_t i = 1; i < path.size(); ++i) {
     cost_to.push_back(
-      cost_to.back() + check_segment(map, exempt, path[i - 1], path[i], params).cost);
+      cost_to.back() + check_segment(map, path[i - 1], path[i], params, path.front()).cost);
   }
 
   std::vector<Eigen::Vector3d> out{path.front()};
@@ -243,8 +281,9 @@ std::vector<Eigen::Vector3d> shortcut(
   while (i + 1 < path.size()) {
     size_t next = i + 1;
     for (size_t j = path.size() - 1; j > i + 1; --j) {
-      const auto seg = check_segment(map, exempt, path[i], path[j], params);
-      if (seg.clear && seg.cost <= cost_to[j] - cost_to[i] + 1e-9) {
+      const auto seg = check_segment(map, path[i], path[j], params, path.front());
+      const double replaced = cost_to[j] - cost_to[i];
+      if (seg.clear && seg.cost <= replaced * (1.0 + params.shortcut_slack) + 1e-9) {
         next = j;
         break;
       }
@@ -339,7 +378,6 @@ SmoothingResult smooth(
     }
   }
 
-  const Key exempt = map.key(pts.front());
   const double dt = 0.25 * map.resolution() / params.max_vel;
   std::vector<bool> stopped(n, false);
 
@@ -447,6 +485,7 @@ SmoothingResult smooth(
 
     std::vector<bool> too_fast(m - 1, false), collides(m - 1, false);
     size_t seg = 0;
+    EscapeCheck clearance(map, params.collision_radius);
     for (double t = 0.0; ; t = std::min(t + dt, traj->duration())) {
       while (seg + 2 < m && t >= traj->knot_time(seg + 1)) {
         ++seg;
@@ -457,8 +496,8 @@ SmoothingResult smooth(
       {
         too_fast[seg] = true;
       }
-      const Key key = map.key(p.position);
-      if (key != exempt && map.distance(key) <= params.collision_radius) {
+      const Key k = map.key(p.position);
+      if (!clearance.ok(k) || unseen_near(map, k, pts.front(), params.known_radius)) {
         collides[seg] = true;
       }
       if (t >= traj->duration()) {
@@ -552,9 +591,31 @@ std::optional<double> first_collision(
   }
   // Distances only around the trajectory: cheap enough to check every map update.
   const DistanceMap distances(map, box, radius);
+  EscapeCheck clearance(distances, radius);
   for (const auto & [t, p] : samples) {
-    if (distances.distance(distances.key(p)) <= radius) {
+    if (!clearance.ok(distances.key(p))) {
       return t;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<double> first_unseen(
+  const OccupancyMap & map, const trajectory_server::Trajectory & trajectory, double t0,
+  double radius, double dt)
+{
+  t0 = std::clamp(t0, 0.0, trajectory.duration());
+  const Eigen::Vector3d start = trajectory.sample(t0).position;
+  for (double t = t0; ; t = std::min(t + dt, trajectory.duration())) {
+    const Eigen::Vector3d p = trajectory.sample(t).position;
+    if ((p - start).norm() > radius + map.resolution()) {
+      break;  // left the radius: even its voxel's center is out
+    }
+    if (unseen_near(map, map.key(p), start, radius)) {
+      return t;
+    }
+    if (t >= trajectory.duration()) {
+      break;
     }
   }
   return std::nullopt;
